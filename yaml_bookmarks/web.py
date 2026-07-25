@@ -28,7 +28,13 @@ from html.parser import HTMLParser
 
 from flask import Flask, Response, jsonify, request
 
-from .storage import Bookmark, BookmarkStore, normalize_folder
+from .storage import (
+    Bookmark,
+    BookmarkStore,
+    EncryptionRequired,
+    VaultLocked,
+    normalize_folder,
+)
 
 APP_NAME = "YAML Bookmarks"
 
@@ -252,16 +258,23 @@ def create_app(store: BookmarkStore) -> Flask:
             return jsonify({"error": str(exc)}), 400
         # While a password is engaged, a *new* bookmark is encrypted with it;
         # editing an existing bookmark keeps whatever kind it already is.
-        b = store.save(
-            Bookmark(
-                url=url,
-                folder=folder,
-                title=(data.get("title") or "").strip(),
-                description=(data.get("description") or "").strip(),
-                tags=_clean_tags(data.get("tags")),
-            ),
-            encrypt=store.is_unlocked,
-        )
+        try:
+            b = store.save(
+                Bookmark(
+                    url=url,
+                    folder=folder,
+                    title=(data.get("title") or "").strip(),
+                    description=(data.get("description") or "").strip(),
+                    tags=_clean_tags(data.get("tags")),
+                ),
+                encrypt=store.is_unlocked,
+            )
+        except EncryptionRequired:
+            return jsonify(
+                {"error": "Encryption is required — unlock with a password (padlock) first."}
+            ), 400
+        except VaultLocked as exc:
+            return jsonify({"error": str(exc)}), 400
         return jsonify(b.to_dict())
 
     @app.delete("/api/bookmarks")
@@ -281,7 +294,9 @@ def create_app(store: BookmarkStore) -> Flask:
 
     @app.get("/api/status")
     def api_status() -> Response:
-        return jsonify({"unlocked": store.is_unlocked})
+        return jsonify(
+            {"unlocked": store.is_unlocked, "allow_unencrypted": store.allow_unencrypted}
+        )
 
     @app.post("/api/unlock")
     def api_unlock() -> Response:
@@ -417,7 +432,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v10';
+const CACHE = 'yaml-bookmarks-v11';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -709,6 +724,7 @@ let shown = [];                // items currently rendered (index-based actions)
 let editingUrl = null;
 let editingFolder = null;
 let unlocked = false;
+let allowUnencrypted = true;
 
 async function load() {
   const [b, f] = await Promise.all([
@@ -974,7 +990,16 @@ function updateLock() {
   btn.title = unlocked
     ? 'Password engaged — click to lock and hide encrypted bookmarks'
     : 'Show encrypted bookmarks (enter a password)';
-  $('encHint').style.display = unlocked ? 'block' : 'none';
+  const hint = $('encHint');
+  if (unlocked) {
+    hint.textContent = '🔒 New bookmarks will be encrypted';
+    hint.style.display = 'block';
+  } else if (!allowUnencrypted) {
+    hint.textContent = '🔒 Unlock (padlock) to add bookmarks — encryption is required';
+    hint.style.display = 'block';
+  } else {
+    hint.style.display = 'none';
+  }
 }
 
 function openPwModal() {
@@ -1060,6 +1085,7 @@ async function init() {
   try {
     const s = await fetch('/api/status').then((r) => r.json());
     unlocked = !!s.unlocked;
+    allowUnencrypted = s.allow_unencrypted !== false;
   } catch (e) { unlocked = false; }
   updateLock();
   await load();

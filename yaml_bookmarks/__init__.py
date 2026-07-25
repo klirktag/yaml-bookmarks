@@ -13,13 +13,24 @@ same URL always maps to the same file on Windows, Linux and macOS.
 """
 
 from .escaping import escape_url, unescape_url, filename_for_url
-from .storage import Bookmark, BookmarkStore, DEFAULT_STORE_DIR, VaultLocked
+from .settings import Settings, load_settings, ensure_settings_file
+from .storage import (
+    Bookmark,
+    BookmarkStore,
+    DEFAULT_STORE_DIR,
+    EncryptionRequired,
+    VaultLocked,
+)
 
 __all__ = [
     "Bookmark",
     "BookmarkStore",
     "DEFAULT_STORE_DIR",
+    "EncryptionRequired",
     "VaultLocked",
+    "Settings",
+    "load_settings",
+    "ensure_settings_file",
     "escape_url",
     "unescape_url",
     "filename_for_url",

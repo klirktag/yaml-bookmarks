@@ -2,7 +2,13 @@
 # Copyright (C) 2026 The yaml-bookmarks authors
 import pytest
 
-from yaml_bookmarks.storage import BookmarkStore, Bookmark, VaultLocked, normalize_folder
+from yaml_bookmarks.storage import (
+    Bookmark,
+    BookmarkStore,
+    EncryptionRequired,
+    VaultLocked,
+    normalize_folder,
+)
 
 
 @pytest.fixture
@@ -255,6 +261,35 @@ def test_delete_orphaned_folder_rejected(store):
     store.create_folder("orphaned")
     with pytest.raises(ValueError):
         store.delete_folder("orphaned")
+
+
+# -- settings / allow_unencrypted --------------------------------------------
+
+def test_settings_file_is_not_a_bookmark(store, tmp_path):
+    (tmp_path / "settings.yaml").write_text(
+        "port: 22222\nallow_unencrypted: true\n", encoding="utf-8"
+    )
+    store.add("https://a.example")
+    assert [b.url for b in store.list()] == ["https://a.example"]
+
+
+def test_allow_unencrypted_false_blocks_plaintext_add(store):
+    store.allow_unencrypted = False
+    with pytest.raises(EncryptionRequired):
+        store.add("https://a.example")
+    with pytest.raises(EncryptionRequired):
+        store.save(Bookmark(url="https://b.example"))
+    # encrypted still works
+    store.unlock("pw")
+    store.add("https://c.example", encrypt=True)
+    assert store.get("https://c.example") is not None
+
+
+def test_allow_unencrypted_false_allows_editing_existing_plaintext(store):
+    store.add("https://a.example", title="v1")   # created while allowed
+    store.allow_unencrypted = False
+    up = store.save(Bookmark(url="https://a.example", title="v2"))  # editing, not adding
+    assert up.title == "v2" and not up.encrypted
 
 
 def test_new_bookmarks_join_existing_vault_salt(store, tmp_path):

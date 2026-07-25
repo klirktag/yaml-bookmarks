@@ -116,6 +116,23 @@ created_at: '2026-07-25T20:41:28+00:00'
 updated_at: '2026-07-25T20:41:28+00:00'
 ```
 
+## Settings
+
+Global settings live in `~/.yaml-bookmarks/settings.yaml`, created with
+documented defaults on first run:
+
+```yaml
+port: 22222              # port the web UI listens on
+allow_unencrypted: true  # if false, every new bookmark must be encrypted
+```
+
+- `port` — the web UI port; `yaml-bookmarks web --port N` overrides it.
+- `allow_unencrypted` — set to `false` to require encryption: adding an
+  unencrypted bookmark is then rejected (existing ones are left as-is). In the
+  web UI you'll be prompted to unlock the padlock before adding.
+
+Edit the file and restart the web server for changes to take effect.
+
 ## Tests
 
 ```bash

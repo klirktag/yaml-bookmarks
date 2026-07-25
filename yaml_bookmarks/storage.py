@@ -36,6 +36,7 @@ import yaml
 from . import crypto
 from .crypto import CryptoSession, is_encrypted, new_filename
 from .escaping import filename_for_url
+from .settings import SETTINGS_FILENAME
 
 DEFAULT_STORE_DIR = Path(
     os.environ.get("YAML_BOOKMARKS_DIR", Path.home() / ".yaml-bookmarks")
@@ -53,6 +54,10 @@ ORPHANED_FOLDER = "orphaned"
 
 class VaultLocked(Exception):
     """Raised when an encrypted operation is attempted without an unlocked vault."""
+
+
+class EncryptionRequired(Exception):
+    """Raised when adding an unencrypted bookmark while ``allow_unencrypted`` is off."""
 
 
 class _LockedBookmark(Exception):
@@ -133,6 +138,9 @@ class BookmarkStore:
     def __init__(self, directory: Path | str = DEFAULT_STORE_DIR):
         self.directory = Path(directory).expanduser()
         self._session: CryptoSession | None = None
+        # When False, adding a new *unencrypted* bookmark is rejected. Set from
+        # settings.yaml by the CLI / web entry points.
+        self.allow_unencrypted: bool = True
 
     # -- crypto session ------------------------------------------------------
 
@@ -190,8 +198,13 @@ class BookmarkStore:
         return "" if rel == Path(".") else rel.as_posix()
 
     def _all_paths(self) -> Iterator[Path]:
-        if self.directory.exists():
-            yield from self.directory.rglob("*.yaml")
+        if not self.directory.exists():
+            return
+        settings_file = self.directory / SETTINGS_FILENAME
+        for path in self.directory.rglob("*.yaml"):
+            if path == settings_file:
+                continue  # the global settings file is not a bookmark
+            yield path
 
     # -- reading -------------------------------------------------------------
 
@@ -429,6 +442,10 @@ class BookmarkStore:
                 raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
             self._write_encrypted(bookmark)
         else:
+            if not self.allow_unencrypted:
+                raise EncryptionRequired(
+                    "unencrypted bookmarks are not allowed (allow_unencrypted is false)"
+                )
             path = self._path_for(url, folder)
             if path.exists():
                 where = f"{folder}/" if folder else "the root folder"
@@ -480,6 +497,10 @@ class BookmarkStore:
         else:
             use_encrypt = encrypt
             existing_path = None
+        if existing is None and not use_encrypt and not self.allow_unencrypted:
+            raise EncryptionRequired(
+                "unencrypted bookmarks are not allowed (allow_unencrypted is false)"
+            )
         bookmark.encrypted = use_encrypt
         if use_encrypt:
             self._require_session()

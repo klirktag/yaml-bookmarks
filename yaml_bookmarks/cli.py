@@ -13,7 +13,8 @@ import argparse
 import getpass
 import sys
 
-from .storage import BookmarkStore, VaultLocked, normalize_folder
+from .settings import ensure_settings_file
+from .storage import BookmarkStore, EncryptionRequired, VaultLocked, normalize_folder
 
 
 def _split_tags(value: str | None) -> list[str] | None:
@@ -52,10 +53,12 @@ def cmd_add(store: BookmarkStore, args) -> int:
             description=args.description or "",
             tags=_split_tags(args.tags) or [],
         )
-    except (FileExistsError, ValueError, VaultLocked) as exc:
+    except (FileExistsError, ValueError, VaultLocked, EncryptionRequired) as exc:
         print(f"error: {exc}", file=sys.stderr)
         if isinstance(exc, FileExistsError):
             print("hint: use 'update' to change an existing bookmark.", file=sys.stderr)
+        elif isinstance(exc, EncryptionRequired):
+            print("hint: add it encrypted with -e (and -p PASSWORD).", file=sys.stderr)
         return 1
     lock = " 🔒" if b.encrypted else ""
     print(f"added: {b.url}{lock}" + (f"  → {b.folder}" if b.folder else ""))
@@ -147,7 +150,9 @@ def cmd_mkdir(store: BookmarkStore, args) -> int:
 def cmd_web(store: BookmarkStore, args) -> int:
     from .web import run_server
 
-    run_server(store, host=args.host, port=args.port, open_browser=not args.no_browser)
+    # Explicit --port wins; otherwise use settings.yaml (default 22222).
+    port = args.port if args.port is not None else args.settings.port
+    run_server(store, host=args.host, port=port, open_browser=not args.no_browser)
     return 0
 
 
@@ -221,7 +226,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_web = sub.add_parser("web", help="launch the localhost-only web UI")
     p_web.add_argument("--host", default="127.0.0.1", help="default: 127.0.0.1")
-    p_web.add_argument("--port", type=int, default=22222, help="default: 22222")
+    p_web.add_argument(
+        "--port", type=int, default=None, help="override the port from settings.yaml (22222)"
+    )
     p_web.add_argument(
         "--no-browser", action="store_true", help="do not open a browser automatically"
     )
@@ -234,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     store = BookmarkStore(args.dir) if args.dir else BookmarkStore()
+    # Global settings live in <store>/settings.yaml (created on first run).
+    args.settings = ensure_settings_file(store.directory)
+    store.allow_unencrypted = args.settings.allow_unencrypted
     # A bare "--password" (const "") prompts; "--password PW" unlocks directly.
     password = getattr(args, "password", None)
     if password is not None:

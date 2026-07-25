@@ -36,6 +36,7 @@ yaml_bookmarks/
 ├── escaping.py      URL  <->  filesystem-safe file name
 ├── storage.py       Bookmark dataclass + BookmarkStore (all disk I/O) + folder rules
 ├── crypto.py        password-based encryption (scrypt KDF + AES-256-GCM)
+├── settings.py      global settings.yaml (port, allow_unencrypted)
 ├── cli.py           argparse CLI, thin wrapper over BookmarkStore
 └── web.py           Flask app: JSON API, metadata fetch, PWA assets, inlined UI
 tests/
@@ -191,6 +192,19 @@ Front-end state (vanilla JS, no framework): `all` (bookmarks), `folders`,
 collection filters the list and pre-fills the form's Collection field so new adds
 land there. Editing sends `original_folder` so a changed collection moves the
 file.
+
+## Settings
+
+Global settings live in `<store>/settings.yaml` (always the store root), created
+with a documented default on first run by `settings.ensure_settings_file()`. The
+CLI/web entry points load it and apply it; `BookmarkStore` skips this file in
+`_all_paths()` so it's never a bookmark. Current keys:
+
+- `port` — web UI port (explicit `--port` overrides it).
+- `allow_unencrypted` — when `false`, adding a *new* unencrypted bookmark raises
+  `EncryptionRequired` (`storage.py`); editing existing plaintext bookmarks is
+  still allowed. Enforced in `BookmarkStore.add`/`save` via
+  `store.allow_unencrypted`, surfaced in the web `/api/status` and as a hint.
 
 ## Encryption
 
