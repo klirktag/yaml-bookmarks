@@ -1,0 +1,27 @@
+[project]
+name = "yaml-bookmarks"
+version = "0.1.0"
+description = "A personal, YAML-backed bookmark manager with a CLI and a localhost-only PWA web UI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "LGPL-3.0-or-later" }
+classifiers = [
+    "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Environment :: Web Environment",
+    "Intended Audience :: End Users/Desktop",
+]
+dependencies = [
+    "PyYAML>=6.0",
+    "Flask>=3.0",
+]
+
+[project.scripts]
+yaml-bookmarks = "yaml_bookmarks.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["yaml_bookmarks"]
