@@ -147,6 +147,27 @@ def cmd_mkdir(store: BookmarkStore, args) -> int:
     return 0
 
 
+def cmd_import(store: BookmarkStore, args) -> int:
+    from .importers import import_raindrop
+
+    try:
+        text = open(args.file, encoding="utf-8", errors="replace").read()
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.encrypt and not store.is_unlocked:
+        store.unlock(args.password or getpass.getpass("Encryption password: "))
+    encrypt = store.is_unlocked
+    if not encrypt and not store.allow_unencrypted:
+        print("error: encryption is required; unlock with -p PASSWORD", file=sys.stderr)
+        return 1
+    summary = import_raindrop(store, text, encrypt=encrypt)
+    enc = " (encrypted)" if summary["encrypted"] else ""
+    failed = f", {summary['failed']} failed" if summary["failed"] else ""
+    print(f"imported {summary['added']} of {summary['total']} bookmarks{enc}{failed}")
+    return 0
+
+
 def cmd_web(store: BookmarkStore, args) -> int:
     from .web import run_server
 
@@ -223,6 +244,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_mkdir = sub.add_parser("mkdir", help="create an (empty) folder")
     p_mkdir.add_argument("folder")
     p_mkdir.set_defaults(func=cmd_mkdir)
+
+    p_imp = sub.add_parser(
+        "import", parents=[pw], help="import bookmarks from a Raindrop.io CSV export"
+    )
+    p_imp.add_argument("file", help="path to the CSV file")
+    p_imp.add_argument("--format", default="raindrop", choices=["raindrop"])
+    p_imp.add_argument(
+        "-e", "--encrypt", action="store_true", help="import the bookmarks encrypted"
+    )
+    p_imp.set_defaults(func=cmd_import)
 
     p_web = sub.add_parser("web", help="launch the localhost-only web UI")
     p_web.add_argument("--host", default="127.0.0.1", help="default: 127.0.0.1")

@@ -37,6 +37,7 @@ yaml_bookmarks/
 ├── storage.py       Bookmark dataclass + BookmarkStore (all disk I/O) + folder rules
 ├── crypto.py        password-based encryption (scrypt KDF + AES-256-GCM)
 ├── settings.py      global settings.yaml (port, allow_unencrypted)
+├── importers.py     import from other tools (Raindrop.io CSV)
 ├── cli.py           argparse CLI, thin wrapper over BookmarkStore
 └── web.py           Flask app: JSON API, metadata fetch, PWA assets, inlined UI
 tests/
@@ -192,6 +193,15 @@ Front-end state (vanilla JS, no framework): `all` (bookmarks), `folders`,
 collection filters the list and pre-fills the form's Collection field so new adds
 land there. Editing sends `original_folder` so a changed collection moves the
 file.
+
+## Import
+
+`importers.py` imports from other tools' exports (currently the Raindrop.io CSV
+export), surfaced through the CLI `import` command and the web **⬆ Import CSV**
+button (`POST /api/import`). **All importer details — CSV format, field/folder
+mapping, encryption and idempotency rules — live in
+[docs/importer.md](docs/importer.md).** Keep that document as the source of truth
+and update it when import behaviour changes.
 
 ## Settings
 

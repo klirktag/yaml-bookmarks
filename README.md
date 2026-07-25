@@ -116,6 +116,19 @@ created_at: '2026-07-25T20:41:28+00:00'
 updated_at: '2026-07-25T20:41:28+00:00'
 ```
 
+## Import
+
+Import a **Raindrop.io CSV export** — its nested `Collection / Sub` folders become
+`Collection/Sub`, `Unsorted` becomes the root, and tags/notes/dates carry over.
+
+- **Web UI**: click **⬆ Import CSV** in the collections sidebar and pick the file.
+- **CLI**: `yaml-bookmarks import export.csv` (add `-e -p PASSWORD` to import
+  encrypted).
+
+If a password is engaged (or `allow_unencrypted` is false and you've unlocked),
+imported bookmarks are stored **encrypted**. Re-importing the same file is
+idempotent (it upserts rather than duplicating).
+
 ## Settings
 
 Global settings live in `~/.yaml-bookmarks/settings.yaml`, created with

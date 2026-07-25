@@ -28,6 +28,7 @@ from html.parser import HTMLParser
 
 from flask import Flask, Response, jsonify, request
 
+from .importers import import_raindrop
 from .storage import (
     Bookmark,
     BookmarkStore,
@@ -364,6 +365,24 @@ def create_app(store: BookmarkStore) -> Flask:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"moved_to": moved_to})
 
+    @app.post("/api/import")
+    def api_import() -> Response:
+        fmt = request.args.get("format", "raindrop")
+        if fmt != "raindrop":
+            return jsonify({"error": f"unsupported import format: {fmt!r}"}), 400
+        # If encryption is required but the vault is locked, we can neither store
+        # plaintext nor encrypt — ask the user to unlock first.
+        if not store.is_unlocked and not store.allow_unencrypted:
+            return jsonify(
+                {"error": "Unlock with a password (padlock) first — encryption is required."}
+            ), 400
+        text = request.get_data(as_text=True)
+        if not text.strip():
+            return jsonify({"error": "no CSV data received"}), 400
+        # If a password is engaged, imported bookmarks are encrypted too.
+        summary = import_raindrop(store, text, encrypt=store.is_unlocked)
+        return jsonify(summary)
+
     @app.get("/api/fetch-meta")
     def api_fetch_meta():
         url = (request.args.get("url") or "").strip()
@@ -432,7 +451,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v11';
+const CACHE = 'yaml-bookmarks-v12';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -561,6 +580,12 @@ _INDEX_HTML = """<!doctype html>
     color: var(--muted); font-size: .7rem; }
   .chev { cursor: pointer; }
   .sep { height: 1px; background: var(--border); margin: 8px 4px; }
+  .import-btn {
+    width: 100%; margin-top: 12px; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); font-size: .9rem; padding: 8px 10px; font-weight: 600;
+  }
+  .import-btn:hover:not(:disabled) { background: var(--border); }
+  .import-btn:disabled { opacity: .6; cursor: default; }
 
   /* Compose form */
   form.add {
@@ -684,6 +709,9 @@ _INDEX_HTML = """<!doctype html>
       <div class="side-head"><span>Collections</span>
         <button class="mini" id="newFolderBtn" title="New collection">＋</button></div>
       <div id="tree"></div>
+      <button class="import-btn" id="importBtn" type="button"
+              title="Import a Raindrop.io CSV export">⬆ Import CSV</button>
+      <input id="importFile" type="file" accept=".csv,text/csv" style="display:none">
     </nav>
 
     <section class="main">
@@ -958,6 +986,35 @@ $('feDeleteBtn').addEventListener('click', async () => {
   if (!d) return;
   filter = ALL;
   await load();
+});
+
+/* ---- Import (Raindrop CSV) ---- */
+$('importBtn').addEventListener('click', () => $('importFile').click());
+$('importFile').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const btn = $('importBtn');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Importing…';
+  try {
+    const text = await file.text();
+    const res = await fetch('/api/import?format=raindrop', {
+      method: 'POST', headers: {'Content-Type': 'text/csv'}, body: text,
+    });
+    const d = await res.json();
+    if (!res.ok) { alert(d.error || 'Import failed.'); return; }
+    await load();
+    const enc = d.encrypted ? ' (encrypted 🔒)' : '';
+    const failed = d.failed ? ` ${d.failed} skipped.` : '';
+    alert(`Imported ${d.added} of ${d.total} bookmarks${enc}.${failed}`);
+  } catch (err) {
+    alert('Could not read or import that file.');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+    e.target.value = '';   // allow re-selecting the same file
+  }
 });
 
 $('fetchBtn').addEventListener('click', async () => {
