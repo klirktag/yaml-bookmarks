@@ -250,6 +250,8 @@ def create_app(store: BookmarkStore) -> Flask:
                     store.move(url, original, folder)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        # While a password is engaged, a *new* bookmark is encrypted with it;
+        # editing an existing bookmark keeps whatever kind it already is.
         b = store.save(
             Bookmark(
                 url=url,
@@ -257,7 +259,8 @@ def create_app(store: BookmarkStore) -> Flask:
                 title=(data.get("title") or "").strip(),
                 description=(data.get("description") or "").strip(),
                 tags=_clean_tags(data.get("tags")),
-            )
+            ),
+            encrypt=store.is_unlocked,
         )
         return jsonify(b.to_dict())
 
@@ -275,6 +278,30 @@ def create_app(store: BookmarkStore) -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"removed": removed})
+
+    @app.get("/api/status")
+    def api_status() -> Response:
+        return jsonify({"unlocked": store.is_unlocked})
+
+    @app.post("/api/unlock")
+    def api_unlock() -> Response:
+        data = request.get_json(silent=True) or {}
+        password = data.get("password") or ""
+        if not password:
+            return jsonify({"error": "password is required"}), 400
+        count = store.unlock(password)
+        return jsonify(
+            {
+                "unlocked": True,
+                "count": count,
+                "encrypted_total": store.encrypted_file_count(),
+            }
+        )
+
+    @app.post("/api/lock")
+    def api_lock() -> Response:
+        store.lock()
+        return jsonify({"unlocked": False})
 
     @app.get("/api/folders")
     def api_folders() -> Response:
@@ -357,7 +384,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v6';
+const CACHE = 'yaml-bookmarks-v8';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -421,6 +448,34 @@ _INDEX_HTML = """<!doctype html>
   }
   header h1 { font-size: 1.1rem; margin: 0; font-weight: 700; letter-spacing: .2px; }
   header .sub { color: rgba(255,255,255,.75); font-size: .82rem; margin-left: auto; }
+  .lockbtn {
+    background: rgba(255,255,255,.16); color: #fff; border: none; border-radius: 9px;
+    padding: 6px 11px; font-size: 1.15rem; line-height: 1; cursor: pointer;
+  }
+  .lockbtn:hover { background: rgba(255,255,255,.30); }
+  .lockbtn.engaged { background: #fff; }
+  .enc-hint { font-size: .8rem; color: var(--accent2); font-weight: 600; }
+  .lock-badge { margin-left: 6px; }
+  /* Password modal */
+  .modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 50;
+    display: flex; align-items: center; justify-content: center; padding: 20px;
+  }
+  .modal-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 20px; width: 100%; max-width: 360px; box-shadow: 0 12px 44px rgba(0,0,0,.35);
+  }
+  .modal-title { font-weight: 700; margin-bottom: 12px; }
+  .pw-row { display: flex; gap: 8px; }
+  .pw-row input { flex: 1; min-width: 0; }
+  /* Mask a plain text input (so the browser never treats it as a saveable password). */
+  .masked { -webkit-text-security: disc; text-security: disc; }
+  .eye {
+    flex: 0 0 auto; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); font-size: 1.05rem; padding: 8px 11px;
+  }
+  .eye:hover { background: var(--border); }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
   .wrap { max-width: 1280px; margin: 0 auto; padding: 20px; }
   .app { display: grid; gap: 20px; }
   @media (min-width: 1000px) {
@@ -518,12 +573,15 @@ _INDEX_HTML = """<!doctype html>
 <header>
   <h1>🔖 YAML Bookmarks</h1>
   <span class="sub">personal · localhost</span>
+  <button id="lockBtn" class="lockbtn" type="button"
+          title="Show encrypted bookmarks">🔓</button>
 </header>
 <div class="wrap">
   <div class="app">
     <aside class="compose">
       <form class="add" id="addForm">
         <div class="form-title" id="formTitle">Add a bookmark</div>
+        <div class="enc-hint" id="encHint" style="display:none">🔒 New bookmarks will be encrypted</div>
         <div class="url-row">
           <input id="f-url" type="url" placeholder="https://example.com" required autocomplete="off">
           <button type="button" id="fetchBtn"
@@ -561,6 +619,22 @@ _INDEX_HTML = """<!doctype html>
   <footer class="foot">__FOOTER__</footer>
 </div>
 
+<div id="pwModal" class="modal" style="display:none">
+  <div class="modal-card">
+    <div class="modal-title">Unlock encrypted bookmarks</div>
+    <div class="pw-row">
+      <input id="pwInput" class="masked" type="text" inputmode="text"
+             autocomplete="off" autocapitalize="off" autocorrect="off"
+             spellcheck="false" placeholder="Password">
+      <button type="button" id="pwEye" class="eye" title="Show password">👁</button>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="ghost" id="pwCancel">Cancel</button>
+      <button type="button" id="pwOk">Unlock</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const ALL = '*ALL*';           // sentinel: '*' is illegal in folder names, so no clash
@@ -571,6 +645,7 @@ let collapsed = new Set();
 let shown = [];                // items currently rendered (index-based actions)
 let editingUrl = null;
 let editingFolder = null;
+let unlocked = false;
 
 async function load() {
   const [b, f] = await Promise.all([
@@ -655,8 +730,9 @@ function renderList() {
     const tags = (b.tags||[]).map((t) => `<span class="tag">${esc(t)}</span>`).join('');
     const fb = b.folder
       ? `<span class="fbadge" data-goto="${esc(b.folder)}">📁 ${esc(b.folder)}</span>` : '';
+    const lock = b.encrypted ? '<span class="lock-badge" title="Encrypted">🔒</span>' : '';
     return `<li class="card">
-      <div class="title">${esc(b.title || b.url)}</div>
+      <div class="title">${esc(b.title || b.url)}${lock}</div>
       <a class="url" href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.url)}</a>
       ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}
       ${(fb || tags) ? `<div class="meta">${fb}${tags}</div>` : ''}
@@ -769,6 +845,78 @@ $('fetchBtn').addEventListener('click', async () => {
   }
 });
 
+/* ---- Encryption padlock ---- */
+function updateLock() {
+  const btn = $('lockBtn');
+  btn.textContent = unlocked ? '🔒' : '🔓';
+  btn.classList.toggle('engaged', unlocked);
+  btn.title = unlocked
+    ? 'Password engaged — click to lock and hide encrypted bookmarks'
+    : 'Show encrypted bookmarks (enter a password)';
+  $('encHint').style.display = unlocked ? 'block' : 'none';
+}
+
+function openPwModal() {
+  $('pwInput').value = '';
+  $('pwInput').classList.add('masked');   // masked by default
+  $('pwEye').textContent = '👁';
+  $('pwEye').title = 'Show password';
+  $('pwModal').style.display = 'flex';
+  setTimeout(() => $('pwInput').focus(), 40);
+}
+function closePwModal() {
+  $('pwModal').style.display = 'none';
+  $('pwInput').value = '';                 // don't leave the password lying around
+}
+
+async function doUnlock(password) {
+  const res = await fetch('/api/unlock', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ password }),
+  });
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || 'Could not unlock.'); return; }
+  unlocked = true;
+  updateLock();
+  await load();
+  if (d.count === 0 && d.encrypted_total > 0) {
+    alert('No encrypted bookmarks match that password. New bookmarks you add will be encrypted with it.');
+  }
+}
+
+$('lockBtn').addEventListener('click', async () => {
+  if (unlocked) {
+    await fetch('/api/lock', { method: 'POST' });
+    unlocked = false;
+    updateLock();
+    await load();
+  } else {
+    openPwModal();
+  }
+});
+
+$('pwEye').addEventListener('click', () => {
+  const inp = $('pwInput');
+  const masked = inp.classList.toggle('masked');
+  $('pwEye').textContent = masked ? '👁' : '🙈';
+  $('pwEye').title = masked ? 'Show password' : 'Hide password';
+  inp.focus();
+});
+$('pwCancel').addEventListener('click', closePwModal);
+$('pwOk').addEventListener('click', async () => {
+  const pw = $('pwInput').value;
+  if (!pw) { $('pwInput').focus(); return; }
+  closePwModal();
+  await doUnlock(pw);
+});
+$('pwInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('pwOk').click(); }
+  else if (e.key === 'Escape') { e.preventDefault(); closePwModal(); }
+});
+$('pwModal').addEventListener('click', (e) => {
+  if (e.target === $('pwModal')) closePwModal();   // click backdrop to dismiss
+});
+
 $('cancelEdit').addEventListener('click', resetForm);
 $('search').addEventListener('input', renderList);
 
@@ -787,7 +935,15 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
 }
 
-load();
+async function init() {
+  try {
+    const s = await fetch('/api/status').then((r) => r.json());
+    unlocked = !!s.unlocked;
+  } catch (e) { unlocked = false; }
+  updateLock();
+  await load();
+}
+init();
 </script>
 </body>
 </html>

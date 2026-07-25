@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import sys
 
-from .storage import BookmarkStore, normalize_folder
+from .storage import BookmarkStore, VaultLocked, normalize_folder
 
 
 def _split_tags(value: str | None) -> list[str] | None:
@@ -23,10 +24,11 @@ def _split_tags(value: str | None) -> list[str] | None:
 
 def _print_bookmark(b, verbose: bool = False) -> None:
     prefix = f"[{b.folder}] " if b.folder else ""
+    lock = " 🔒" if b.encrypted else ""
     if b.title:
-        print(f"{prefix}{b.title}\n  {b.url}")
+        print(f"{prefix}{b.title}{lock}\n  {b.url}")
     else:
-        print(f"{prefix}{b.url}")
+        print(f"{prefix}{b.url}{lock}")
     if verbose:
         if b.description:
             print(f"  {b.description}")
@@ -38,20 +40,25 @@ def _print_bookmark(b, verbose: bool = False) -> None:
 
 
 def cmd_add(store: BookmarkStore, args) -> int:
+    if args.encrypt and not store.is_unlocked:
+        # Need a password to encrypt; use --password or prompt for one.
+        store.unlock(args.password or getpass.getpass("Encryption password: "))
     try:
         b = store.add(
             args.url,
             folder=args.folder or "",
+            encrypt=args.encrypt,
             title=args.title or "",
             description=args.description or "",
             tags=_split_tags(args.tags) or [],
         )
-    except (FileExistsError, ValueError) as exc:
+    except (FileExistsError, ValueError, VaultLocked) as exc:
         print(f"error: {exc}", file=sys.stderr)
         if isinstance(exc, FileExistsError):
             print("hint: use 'update' to change an existing bookmark.", file=sys.stderr)
         return 1
-    print(f"added: {b.url}" + (f"  → {b.folder}" if b.folder else ""))
+    lock = " 🔒" if b.encrypted else ""
+    print(f"added: {b.url}{lock}" + (f"  → {b.folder}" if b.folder else ""))
     return 0
 
 
@@ -155,15 +162,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_add = sub.add_parser("add", help="add a new bookmark")
+    # Shared --password option: unlocks encrypted bookmarks for the command.
+    pw = argparse.ArgumentParser(add_help=False)
+    pw.add_argument(
+        "-p",
+        "--password",
+        nargs="?",
+        const="",
+        help="unlock encrypted bookmarks (prompts if given with no value)",
+    )
+
+    p_add = sub.add_parser("add", parents=[pw], help="add a new bookmark")
     p_add.add_argument("url")
     p_add.add_argument("-f", "--folder", help="folder to file it under, e.g. work/ideas")
     p_add.add_argument("-t", "--title")
     p_add.add_argument("-d", "--description")
     p_add.add_argument("--tags", help="comma-separated tags")
+    p_add.add_argument(
+        "-e", "--encrypt", action="store_true", help="store this bookmark encrypted"
+    )
     p_add.set_defaults(func=cmd_add)
 
-    p_upd = sub.add_parser("update", help="update an existing bookmark")
+    p_upd = sub.add_parser("update", parents=[pw], help="update an existing bookmark")
     p_upd.add_argument("url")
     p_upd.add_argument("-f", "--folder", help="folder the bookmark is in")
     p_upd.add_argument("-t", "--title")
@@ -171,18 +191,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--tags", help="comma-separated tags (replaces existing)")
     p_upd.set_defaults(func=cmd_update)
 
-    p_mv = sub.add_parser("move", aliases=["mv"], help="move a bookmark to another folder")
+    p_mv = sub.add_parser(
+        "move", parents=[pw], aliases=["mv"], help="move a bookmark to another folder"
+    )
     p_mv.add_argument("url")
     p_mv.add_argument("--to", required=True, help="destination folder (use '' for root)")
     p_mv.add_argument("--from", dest="from_folder", default="", help="source folder")
     p_mv.set_defaults(func=cmd_move)
 
-    p_rm = sub.add_parser("remove", aliases=["rm"], help="remove a bookmark")
+    p_rm = sub.add_parser("remove", parents=[pw], aliases=["rm"], help="remove a bookmark")
     p_rm.add_argument("url")
     p_rm.add_argument("-f", "--folder", help="folder the bookmark is in")
     p_rm.set_defaults(func=cmd_remove)
 
-    p_ls = sub.add_parser("list", aliases=["ls"], help="list bookmarks")
+    p_ls = sub.add_parser("list", parents=[pw], aliases=["ls"], help="list bookmarks")
     p_ls.add_argument("-v", "--verbose", action="store_true")
     p_ls.add_argument("-f", "--folder", help="only show bookmarks in this folder")
     p_ls.add_argument(
@@ -190,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ls.set_defaults(func=cmd_list)
 
-    p_fold = sub.add_parser("folders", help="list folders as a tree")
+    p_fold = sub.add_parser("folders", parents=[pw], help="list folders as a tree")
     p_fold.set_defaults(func=cmd_folders)
 
     p_mkdir = sub.add_parser("mkdir", help="create an (empty) folder")
@@ -212,6 +234,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     store = BookmarkStore(args.dir) if args.dir else BookmarkStore()
+    # A bare "--password" (const "") prompts; "--password PW" unlocks directly.
+    password = getattr(args, "password", None)
+    if password is not None:
+        password = password or getpass.getpass("Password: ")
+        if password:
+            store.unlock(password)
     return args.func(store, args)
 
 

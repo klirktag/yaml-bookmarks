@@ -13,6 +13,12 @@ folder ``work/projects`` is the file
 ``~/.yaml-bookmarks/work/projects/<escaped-url>.yaml``.  The filesystem is the
 single source of truth for folders, so the folder is derived from the path and
 is **not** written into the YAML itself.
+
+Bookmarks may also be **encrypted** (see ``crypto.py`` and
+``docs/encryption.md``).  An encrypted bookmark is a file with ``crypt: true``, a
+random ``<uuid>.yaml`` name, and its whole record stored as one ciphertext blob.
+Encrypted bookmarks are invisible until the store is unlocked with the right
+password; once unlocked they behave like any other bookmark.
 """
 
 from __future__ import annotations
@@ -26,15 +32,27 @@ from typing import Iterator
 
 import yaml
 
+from . import crypto
+from .crypto import CryptoSession, is_encrypted, new_filename
 from .escaping import filename_for_url
 
-DEFAULT_STORE_DIR = Path(os.environ.get("YAML_BOOKMARKS_DIR", Path.home() / ".yaml-bookmarks"))
+DEFAULT_STORE_DIR = Path(
+    os.environ.get("YAML_BOOKMARKS_DIR", Path.home() / ".yaml-bookmarks")
+)
 
 # Characters/names that are unsafe as directory names across Windows/macOS/Linux.
 _ILLEGAL_CHARS = set('<>:"|?*\\') | {chr(c) for c in range(32)}
 _RESERVED_NAMES = {"con", "prn", "aux", "nul"} | {
     f"{p}{i}" for p in ("com", "lpt") for i in range(1, 10)
 }
+
+
+class VaultLocked(Exception):
+    """Raised when an encrypted operation is attempted without an unlocked vault."""
+
+
+class _LockedBookmark(Exception):
+    """Internal: a file is encrypted and cannot be read in the current state."""
 
 
 def normalize_folder(folder: str | None) -> str:
@@ -67,9 +85,14 @@ def _now() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
+# The fields that make up a bookmark's persisted record (plaintext YAML body, or
+# the plaintext that gets encrypted). Folder/encrypted/path are runtime-only.
+_PAYLOAD_FIELDS = ("url", "title", "description", "tags", "created_at", "updated_at")
+
+
 @dataclass
 class Bookmark:
-    """A single bookmark. ``folder`` is derived from the file location."""
+    """A single bookmark. ``folder``/``encrypted``/``path`` are runtime-derived."""
 
     url: str
     title: str = ""
@@ -78,57 +101,172 @@ class Bookmark:
     folder: str = ""
     created_at: str = ""
     updated_at: str = ""
+    encrypted: bool = False
+    path: str = ""
+
+    def payload(self) -> dict:
+        """The persisted record: the core fields only (no folder/encrypted/path)."""
+        d = dataclasses.asdict(self)
+        return {k: d[k] for k in _PAYLOAD_FIELDS}
 
     def to_dict(self) -> dict:
-        """Full dict including ``folder`` (used by the JSON API)."""
-        return dataclasses.asdict(self)
-
-    def to_yaml_dict(self) -> dict:
-        """Persisted form: everything except ``folder`` (the path holds that)."""
-        data = dataclasses.asdict(self)
-        data.pop("folder", None)
-        return data
+        """For the JSON API: payload plus ``folder`` and ``encrypted``."""
+        d = self.payload()
+        d["folder"] = self.folder
+        d["encrypted"] = self.encrypted
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "Bookmark":
         if not data or "url" not in data:
             raise ValueError("bookmark file is missing a 'url' field")
-        known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        return cls(**{k: v for k, v in data.items() if k in _PAYLOAD_FIELDS})
 
 
 class BookmarkStore:
-    """A directory tree full of bookmark YAML files."""
+    """A directory tree full of bookmark YAML files (plaintext and encrypted)."""
 
     def __init__(self, directory: Path | str = DEFAULT_STORE_DIR):
         self.directory = Path(directory).expanduser()
+        self._session: CryptoSession | None = None
+
+    # -- crypto session ------------------------------------------------------
+
+    @property
+    def is_unlocked(self) -> bool:
+        return self._session is not None
+
+    def unlock(self, password: str) -> int:
+        """Engage *password*. Returns how many encrypted bookmarks it reveals.
+
+        The salt of the first matching file becomes the vault the user is in, so
+        newly encrypted bookmarks join it. If nothing matches, a fresh salt is
+        used for new bookmarks (i.e. starting a new vault).
+        """
+        session = CryptoSession(password)
+        count = 0
+        active: bytes | None = None
+        for path in self._all_paths():
+            data = self._load_yaml(path)
+            if not is_encrypted(data):
+                continue
+            payload = session.decrypt(data, aad=path.name.encode("utf-8"))
+            if payload is not None:
+                count += 1
+                if active is None:
+                    try:
+                        active = crypto._b64d(data["salt"])
+                    except (KeyError, ValueError, TypeError):
+                        pass
+        session.active_salt = active if active is not None else crypto.new_salt()
+        self._session = session
+        return count
+
+    def lock(self) -> None:
+        self._session = None
+
+    def encrypted_file_count(self) -> int:
+        """Total number of encrypted files on disk, regardless of password."""
+        return sum(1 for p in self._all_paths() if is_encrypted(self._load_yaml(p)))
 
     # -- paths ---------------------------------------------------------------
 
     def _path_for(self, url: str, folder: str = "") -> Path:
+        """The plaintext file path for a URL (encrypted bookmarks use UUIDs)."""
         folder = normalize_folder(folder)
-        base = self.directory
-        if folder:
-            base = base.joinpath(*folder.split("/"))
+        base = self._folder_dir(folder)
         return base / filename_for_url(url)
+
+    def _folder_dir(self, folder: str) -> Path:
+        folder = normalize_folder(folder)
+        return self.directory.joinpath(*folder.split("/")) if folder else self.directory
 
     def _folder_of(self, path: Path) -> str:
         rel = path.parent.relative_to(self.directory)
         return "" if rel == Path(".") else rel.as_posix()
 
+    def _all_paths(self) -> Iterator[Path]:
+        if self.directory.exists():
+            yield from self.directory.rglob("*.yaml")
+
+    # -- reading -------------------------------------------------------------
+
+    @staticmethod
+    def _load_yaml(path: Path):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return yaml.safe_load(fh)
+        except (OSError, yaml.YAMLError):
+            return None
+
+    def _read(self, path: Path) -> Bookmark:
+        data = self._load_yaml(path)
+        if data is None:
+            raise ValueError(f"could not read {path}")
+        if is_encrypted(data):
+            if self._session is None:
+                raise _LockedBookmark
+            payload = self._session.decrypt(data, aad=path.name.encode("utf-8"))
+            if payload is None:
+                raise _LockedBookmark  # wrong password for this file
+            bookmark = Bookmark.from_dict(payload)
+            bookmark.encrypted = True
+        else:
+            bookmark = Bookmark.from_dict(data)
+            bookmark.encrypted = False
+        bookmark.folder = self._folder_of(path)
+        bookmark.path = str(path)
+        return bookmark
+
+    def _iter(self) -> Iterator[Bookmark]:
+        for path in self._all_paths():
+            try:
+                yield self._read(path)
+            except _LockedBookmark:
+                continue  # encrypted and locked (or wrong password): stay hidden
+            except (ValueError, yaml.YAMLError, OSError):
+                continue  # not a valid bookmark file
+
     # -- queries -------------------------------------------------------------
 
     def exists(self, url: str, folder: str = "") -> bool:
-        return self._path_for(url, folder).exists()
+        return self.get(url, folder) is not None
 
     def get(self, url: str, folder: str = "") -> Bookmark | None:
-        path = self._path_for(url, folder)
-        if not path.exists():
+        folder = normalize_folder(folder)
+        plain = self._path_for(url, folder)
+        if plain.exists():
+            try:
+                bookmark = self._read(plain)
+                if not bookmark.encrypted:
+                    return bookmark
+            except (_LockedBookmark, ValueError, yaml.YAMLError, OSError):
+                pass
+        # Encrypted (UUID-named) bookmarks: scan the folder for a matching URL.
+        if self._session is not None:
+            path = self._find_encrypted_path(url, folder)
+            if path is not None:
+                return self._read(path)
+        return None
+
+    def _find_encrypted_path(self, url: str, folder: str) -> Path | None:
+        """Path of the encrypted bookmark for *url* in *folder* (needs a session)."""
+        if self._session is None:
             return None
-        return self._read(path)
+        base = self._folder_dir(normalize_folder(folder))
+        if not base.exists():
+            return None
+        for path in base.glob("*.yaml"):
+            data = self._load_yaml(path)
+            if not is_encrypted(data):
+                continue
+            payload = self._session.decrypt(data, aad=path.name.encode("utf-8"))
+            if payload is not None and payload.get("url") == url:
+                return path
+        return None
 
     def list(self) -> list[Bookmark]:
-        """All bookmarks (recursively), most recently updated first."""
+        """All *visible* bookmarks (encrypted ones only when unlocked)."""
         return sorted(
             self._iter(),
             key=lambda b: b.updated_at or b.created_at,
@@ -144,30 +282,50 @@ class BookmarkStore:
                     result.add(p.relative_to(self.directory).as_posix())
         return sorted(result)
 
-    def _iter(self) -> Iterator[Bookmark]:
-        if not self.directory.exists():
-            return
-        for path in self.directory.rglob("*.yaml"):
-            try:
-                yield self._read(path)
-            except (ValueError, yaml.YAMLError, OSError):
-                # Skip files that aren't valid bookmarks rather than crash.
-                continue
-
-    def _read(self, path: Path) -> Bookmark:
-        with path.open("r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
-        bookmark = Bookmark.from_dict(data)
-        bookmark.folder = self._folder_of(path)  # location wins over file content
-        return bookmark
-
     # -- folder management ---------------------------------------------------
 
     def create_folder(self, folder: str) -> str:
         folder = normalize_folder(folder)
         if folder:
-            self.directory.joinpath(*folder.split("/")).mkdir(parents=True, exist_ok=True)
+            self._folder_dir(folder).mkdir(parents=True, exist_ok=True)
         return folder
+
+    # -- writing -------------------------------------------------------------
+
+    def _require_session(self) -> CryptoSession:
+        if self._session is None:
+            raise VaultLocked("the vault is locked; unlock with a password first")
+        return self._session
+
+    def _atomic_write(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+
+    def _dump(self, data: dict) -> str:
+        return yaml.safe_dump(
+            data, sort_keys=False, allow_unicode=True, default_flow_style=False
+        )
+
+    def _write_plaintext(self, bookmark: Bookmark, path: Path) -> None:
+        self._atomic_write(path, self._dump(bookmark.payload()))
+        bookmark.path = str(path)
+
+    def _write_encrypted(self, bookmark: Bookmark, path: Path | None = None) -> None:
+        session = self._require_session()
+        if path is None:
+            base = self._folder_dir(bookmark.folder)
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / new_filename()
+            while path.exists():
+                path = base / new_filename()
+        data = session.encrypt(
+            bookmark.payload(), aad=path.name.encode("utf-8"), salt=session.active_salt
+        )
+        self._atomic_write(path, self._dump(data))
+        bookmark.path = str(path)
 
     # -- mutations -----------------------------------------------------------
 
@@ -176,15 +334,13 @@ class BookmarkStore:
         url: str,
         *,
         folder: str = "",
+        encrypt: bool = False,
         title: str = "",
         description: str = "",
         tags: list[str] | None = None,
     ) -> Bookmark:
         """Create a new bookmark. Raises if one already exists at that folder."""
         folder = normalize_folder(folder)
-        if self.exists(url, folder):
-            where = f"{folder}/" if folder else "the root folder"
-            raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
         now = _now()
         bookmark = Bookmark(
             url=url,
@@ -194,8 +350,20 @@ class BookmarkStore:
             folder=folder,
             created_at=now,
             updated_at=now,
+            encrypted=encrypt,
         )
-        self._write(bookmark)
+        if encrypt:
+            self._require_session()
+            if self._find_encrypted_path(url, folder) is not None:
+                where = f"{folder}/" if folder else "the root folder"
+                raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
+            self._write_encrypted(bookmark)
+        else:
+            path = self._path_for(url, folder)
+            if path.exists():
+                where = f"{folder}/" if folder else "the root folder"
+                raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
+            self._write_plaintext(bookmark, path)
         return bookmark
 
     def update(
@@ -208,8 +376,7 @@ class BookmarkStore:
         tags: list[str] | None = None,
     ) -> Bookmark:
         """Update fields of an existing bookmark. Only passed fields change."""
-        folder = normalize_folder(folder)
-        bookmark = self.get(url, folder)
+        bookmark = self.get(url, normalize_folder(folder))
         if bookmark is None:
             raise FileNotFoundError(f"no bookmark found for {url!r} in folder {folder!r}")
         if title is not None:
@@ -219,53 +386,73 @@ class BookmarkStore:
         if tags is not None:
             bookmark.tags = list(tags)
         bookmark.updated_at = _now()
-        self._write(bookmark)
+        if bookmark.encrypted:
+            self._write_encrypted(bookmark, path=Path(bookmark.path))
+        else:
+            self._write_plaintext(bookmark, Path(bookmark.path))
         return bookmark
 
-    def save(self, bookmark: Bookmark) -> Bookmark:
-        """Create or overwrite a bookmark at ``bookmark.folder`` (upsert)."""
+    def save(self, bookmark: Bookmark, *, encrypt: bool = False) -> Bookmark:
+        """Create or overwrite a bookmark (upsert).
+
+        An existing bookmark keeps its kind (encrypted or plaintext); a brand-new
+        one is encrypted iff *encrypt* is true.
+        """
         bookmark.folder = normalize_folder(bookmark.folder)
+        existing = self.get(bookmark.url, bookmark.folder)
         now = _now()
         if not bookmark.created_at:
-            existing = self.get(bookmark.url, bookmark.folder)
             bookmark.created_at = existing.created_at if existing else now
         bookmark.updated_at = now
-        self._write(bookmark)
+        if existing is not None:
+            use_encrypt = existing.encrypted
+            existing_path: Path | None = Path(existing.path)
+        else:
+            use_encrypt = encrypt
+            existing_path = None
+        bookmark.encrypted = use_encrypt
+        if use_encrypt:
+            self._require_session()
+            self._write_encrypted(bookmark, path=existing_path)
+        else:
+            self._write_plaintext(
+                bookmark, existing_path or self._path_for(bookmark.url, bookmark.folder)
+            )
         return bookmark
 
     def move(self, url: str, src_folder: str, dst_folder: str) -> Bookmark:
         """Move a bookmark from one folder to another, keeping its content."""
-        src = self._path_for(url, src_folder)
-        if not src.exists():
+        src_folder = normalize_folder(src_folder)
+        dst_folder = normalize_folder(dst_folder)
+        bookmark = self.get(url, src_folder)
+        if bookmark is None:
             raise FileNotFoundError(f"no bookmark found for {url!r} in folder {src_folder!r}")
-        bookmark = self._read(src)
-        bookmark.folder = normalize_folder(dst_folder)
+        src_path = Path(bookmark.path)
+        bookmark.folder = dst_folder
         bookmark.updated_at = _now()
-        self._write(bookmark)  # writes to the destination
-        dst = self._path_for(url, bookmark.folder)
-        if src.resolve() != dst.resolve():
-            src.unlink()
+        if bookmark.encrypted:
+            # Keep the same UUID file name so the filename-as-AAD stays valid.
+            dst_dir = self._folder_dir(dst_folder)
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst_path = dst_dir / src_path.name
+            self._write_encrypted(bookmark, path=dst_path)
+        else:
+            dst_path = self._path_for(url, dst_folder)
+            self._write_plaintext(bookmark, dst_path)
+        if src_path.resolve() != Path(bookmark.path).resolve():
+            src_path.unlink()
         return bookmark
 
     def remove(self, url: str, folder: str = "") -> bool:
-        """Delete a bookmark. Returns True if a file was removed."""
-        try:
-            self._path_for(url, folder).unlink()
+        """Delete a bookmark (plaintext or encrypted). True if a file was removed."""
+        folder = normalize_folder(folder)
+        plain = self._path_for(url, folder)
+        if plain.exists():
+            plain.unlink()
             return True
-        except FileNotFoundError:
-            return False
-
-    def _write(self, bookmark: Bookmark) -> None:
-        path = self._path_for(bookmark.url, bookmark.folder)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        text = yaml.safe_dump(
-            bookmark.to_yaml_dict(),
-            sort_keys=False,
-            allow_unicode=True,
-            default_flow_style=False,
-        )
-        # Write atomically so a crash mid-write can't corrupt an existing file.
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
+        if self._session is not None:
+            enc = self._find_encrypted_path(url, folder)
+            if enc is not None:
+                enc.unlink()
+                return True
+        return False

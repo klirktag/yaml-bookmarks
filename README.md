@@ -49,6 +49,28 @@ file's location and is *not* duplicated inside the YAML. Move a file with your
 OS file manager and the app follows along; the same URL may live in more than
 one folder.
 
+## Encryption
+
+Any bookmark can be encrypted with a password. Encrypted bookmarks are stored as
+opaque `<uuid>.yaml` files (the URL never appears in the name or in cleartext),
+and they are **invisible until you unlock with the password** — so someone who
+finds the files can't read them, and the app won't even list them. See
+[docs/encryption.md](docs/encryption.md) for the full design.
+
+```bash
+yaml-bookmarks add https://secret.example -e -p mypassword     # store encrypted (🔒)
+yaml-bookmarks list                                            # encrypted ones are hidden
+yaml-bookmarks list -p mypassword                              # unlock to see them (marked 🔒)
+```
+
+- Encryption uses AES-256-GCM with a key derived from your password via scrypt;
+  the whole record is encrypted, a per-vault salt is embedded in each file, and
+  each file is self-contained — copy any subset to another machine and unlock
+  with the same password.
+- In the web UI, a **padlock** in the header toggles it: click to enter a
+  password (revealing encrypted bookmarks and encrypting new ones), click again
+  to lock and hide them. Only one password is active at a time.
+
 ## Web UI
 
 ```bash

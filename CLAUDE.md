@@ -23,9 +23,10 @@ two front-ends over the same storage layer:
   bookmark's folder must move the file.
 - **No binary assets in the repo.** The PWA icons are generated at runtime (see
   `web.py`), and the HTML/CSS/JS is inlined in `web.py`. Keep it that way so the
-  package stays a pure-Python, easy-to-audit tree.
-- **Keep it simple.** Only two runtime dependencies (PyYAML, Flask). Prefer the
-  standard library over adding packages.
+  repo stays an easy-to-audit tree.
+- **Keep it simple.** Three runtime dependencies: PyYAML, Flask, and
+  `cryptography` (for the optional encryption feature — never hand-roll crypto).
+  Prefer the standard library over adding anything else.
 
 ## Layout
 
@@ -34,6 +35,7 @@ yaml_bookmarks/
 ├── __init__.py      public exports + version
 ├── escaping.py      URL  <->  filesystem-safe file name
 ├── storage.py       Bookmark dataclass + BookmarkStore (all disk I/O) + folder rules
+├── crypto.py        password-based encryption (scrypt KDF + AES-256-GCM)
 ├── cli.py           argparse CLI, thin wrapper over BookmarkStore
 └── web.py           Flask app: JSON API, metadata fetch, PWA assets, inlined UI
 tests/
@@ -189,6 +191,16 @@ Front-end state (vanilla JS, no framework): `all` (bookmarks), `folders`,
 collection filters the list and pre-fills the form's Collection field so new adds
 land there. Editing sends `original_folder` so a changed collection moves the
 file.
+
+## Encryption
+
+Bookmarks can be encrypted with a password. The integration point is `crypto.py`
+plus `BookmarkStore.unlock()` / `lock()` / `is_unlocked` in `storage.py`.
+
+**All encryption details — file format, crypto choices, the locked/visible
+model, CLI flags and web endpoints — live in
+[docs/encryption.md](docs/encryption.md).** Treat that document as the single
+source of truth and update it whenever the encryption behaviour changes.
 
 ## Data format
 

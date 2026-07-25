@@ -2,7 +2,7 @@
 # Copyright (C) 2026 The yaml-bookmarks authors
 import pytest
 
-from yaml_bookmarks.storage import BookmarkStore, Bookmark, normalize_folder
+from yaml_bookmarks.storage import BookmarkStore, Bookmark, VaultLocked, normalize_folder
 
 
 @pytest.fixture
@@ -145,3 +145,75 @@ def test_remove_in_folder(store):
     store.add("https://example.com", folder="a")
     assert store.remove("https://example.com", folder="a") is True
     assert store.get("https://example.com", folder="a") is None
+
+
+# -- encryption --------------------------------------------------------------
+
+def test_encrypted_add_requires_unlock(store):
+    with pytest.raises(VaultLocked):
+        store.add("https://s.example", encrypt=True)
+
+
+def test_encrypted_hidden_until_unlock(store):
+    store.unlock("pw")
+    store.add("https://s.example", encrypt=True, title="Secret")
+    store.lock()
+    assert store.list() == []                       # hidden while locked
+    assert store.get("https://s.example") is None
+    store.unlock("pw")
+    got = store.get("https://s.example")
+    assert got is not None and got.encrypted and got.title == "Secret"
+
+
+def test_encrypted_file_is_opaque_on_disk(store, tmp_path):
+    store.unlock("pw")
+    store.add("https://secret.example/path", encrypt=True, title="T", tags=["k"])
+    files = list(tmp_path.rglob("*.yaml"))
+    assert len(files) == 1
+    text = files[0].read_text(encoding="utf-8")
+    assert "crypt: true" in text
+    assert "secret.example" not in text     # url not leaked
+    assert "url:" not in text and "title:" not in text
+
+
+def test_wrong_password_reveals_nothing(store):
+    store.unlock("right")
+    store.add("https://s.example", encrypt=True)
+    store.lock()
+    store.unlock("wrong")
+    assert store.list() == []
+
+
+def test_encrypted_update_move_remove(store):
+    store.unlock("pw")
+    store.add("https://s.example", encrypt=True, folder="a", title="v1")
+    created = store.get("https://s.example", "a").created_at
+    up = store.update("https://s.example", folder="a", title="v2")
+    assert up.title == "v2" and up.created_at == created
+    mv = store.move("https://s.example", "a", "b")
+    assert mv.folder == "b" and mv.encrypted
+    assert store.get("https://s.example", "a") is None
+    assert store.get("https://s.example", "b").title == "v2"
+    assert store.remove("https://s.example", "b") is True
+
+
+def test_plaintext_and_encrypted_coexist(store):
+    store.add("https://plain.example", title="P")
+    store.unlock("pw")
+    store.add("https://enc.example", encrypt=True, title="E")
+    kinds = {b.url: b.encrypted for b in store.list()}
+    assert kinds == {"https://plain.example": False, "https://enc.example": True}
+
+
+def test_new_bookmarks_join_existing_vault_salt(store, tmp_path):
+    store.unlock("pw")
+    store.add("https://a.example", encrypt=True)
+    store.lock()
+    store.unlock("pw")  # re-unlock: should adopt the existing file's salt
+    store.add("https://b.example", encrypt=True)
+    import yaml
+    salts = {
+        yaml.safe_load(p.read_text())["salt"]
+        for p in tmp_path.rglob("*.yaml")
+    }
+    assert len(salts) == 1  # both encrypted files share one vault salt
