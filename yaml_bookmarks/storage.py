@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as _dt
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
@@ -45,6 +46,9 @@ _ILLEGAL_CHARS = set('<>:"|?*\\') | {chr(c) for c in range(32)}
 _RESERVED_NAMES = {"con", "prn", "aux", "nul"} | {
     f"{p}{i}" for p in ("com", "lpt") for i in range(1, 10)
 }
+
+
+ORPHANED_FOLDER = "orphaned"
 
 
 class VaultLocked(Exception):
@@ -289,6 +293,72 @@ class BookmarkStore:
         if folder:
             self._folder_dir(folder).mkdir(parents=True, exist_ok=True)
         return folder
+
+    def _relocate_folder(self, src: str, dst: str) -> str:
+        """Move the whole folder subtree from *src* to *dst* (keeps file names).
+
+        Since file names are preserved, encrypted bookmarks (filename-bound AAD)
+        keep working and nothing needs re-encrypting.
+        """
+        src = normalize_folder(src)
+        dst = normalize_folder(dst)
+        if not src:
+            raise ValueError("cannot move or rename the root folder")
+        if not dst:
+            raise ValueError("a destination folder is required")
+        if dst == src:
+            return dst
+        if dst.startswith(src + "/"):
+            raise ValueError("cannot move a folder into itself")
+        src_dir = self._folder_dir(src)
+        if not src_dir.exists():
+            raise FileNotFoundError(f"no such folder: {src!r}")
+        dst_dir = self._folder_dir(dst)
+        if dst_dir.exists():
+            raise ValueError(f"a folder {dst!r} already exists")
+        dst_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(src_dir, dst_dir)
+        return dst
+
+    def rename_folder(self, folder: str, new_name: str) -> str:
+        """Rename a folder's own name, keeping it under the same parent."""
+        folder = normalize_folder(folder)
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("a folder name is required")
+        parent = "/".join(folder.split("/")[:-1])
+        target = f"{parent}/{new_name}" if parent else new_name
+        return self._relocate_folder(folder, target)
+
+    def move_folder(self, folder: str, new_parent: str) -> str:
+        """Move a folder (keeping its own name) under *new_parent* ("" = root)."""
+        folder = normalize_folder(folder)
+        leaf = folder.split("/")[-1]
+        new_parent = normalize_folder(new_parent)
+        target = f"{new_parent}/{leaf}" if new_parent else leaf
+        return self._relocate_folder(folder, target)
+
+    def delete_folder(self, folder: str) -> str:
+        """Delete a folder, moving any bookmarks inside it to ``orphaned/``.
+
+        Bookmarks keep their sub-path relative to the deleted folder, so nothing
+        collides and nothing is lost. Returns the folder they were moved to.
+        """
+        folder = normalize_folder(folder)
+        if not folder:
+            raise ValueError("cannot delete the root folder")
+        if folder == ORPHANED_FOLDER or folder.startswith(ORPHANED_FOLDER + "/"):
+            raise ValueError(f"cannot delete the {ORPHANED_FOLDER!r} folder")
+        src_dir = self._folder_dir(folder)
+        if not src_dir.exists():
+            raise FileNotFoundError(f"no such folder: {folder!r}")
+        orphan_dir = self._folder_dir(ORPHANED_FOLDER)
+        for path in sorted(src_dir.rglob("*.yaml")):
+            dest = orphan_dir / path.relative_to(src_dir)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, dest)
+        shutil.rmtree(src_dir)
+        return ORPHANED_FOLDER
 
     # -- writing -------------------------------------------------------------
 

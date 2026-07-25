@@ -316,6 +316,39 @@ def create_app(store: BookmarkStore) -> Flask:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"folder": folder})
 
+    @app.post("/api/folders/rename")
+    def api_folder_rename() -> Response:
+        data = request.get_json(silent=True) or {}
+        try:
+            folder = store.rename_folder(data.get("folder") or "", data.get("name") or "")
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"folder": folder})
+
+    @app.post("/api/folders/move")
+    def api_folder_move() -> Response:
+        data = request.get_json(silent=True) or {}
+        try:
+            folder = store.move_folder(data.get("folder") or "", data.get("parent") or "")
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"folder": folder})
+
+    @app.post("/api/folders/delete")
+    def api_folder_delete() -> Response:
+        data = request.get_json(silent=True) or {}
+        try:
+            moved_to = store.delete_folder(data.get("folder") or "")
+        except FileNotFoundError as exc:
+            return jsonify({"error": str(exc)}), 404
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify({"moved_to": moved_to})
+
     @app.get("/api/fetch-meta")
     def api_fetch_meta():
         url = (request.args.get("url") or "").strip()
@@ -384,7 +417,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v8';
+const CACHE = 'yaml-bookmarks-v10';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -520,6 +553,19 @@ _INDEX_HTML = """<!doctype html>
     padding: 16px; display: grid; gap: 10px;
   }
   .form-title { font-weight: 700; font-size: .95rem; }
+  .folder-edit {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 16px; display: grid; gap: 10px; margin-top: 16px;
+  }
+  .folder-edit #feName { word-break: break-all; }
+  .fe-row { display: flex; gap: 8px; }
+  .fe-row input, .fe-row select { flex: 1; min-width: 0; }
+  .fe-row button { flex: 0 0 auto; }
+  .fe-delete {
+    background: transparent; color: var(--danger); border: 1px solid var(--border);
+    width: 100%; margin-top: 2px;
+  }
+  .fe-delete:hover { background: var(--danger); color: #fff; }
   input, textarea, select {
     width: 100%; padding: 10px 12px; border-radius: 9px; border: 1px solid var(--border);
     background: var(--panel2); color: var(--text); font: inherit;
@@ -600,6 +646,23 @@ _INDEX_HTML = """<!doctype html>
           <button type="button" class="ghost" id="cancelEdit" style="display:none">Cancel</button>
         </div>
       </form>
+
+      <div class="folder-edit" id="folderEdit" style="display:none">
+        <div class="form-title">📁 Folder: <span id="feName"></span></div>
+        <label class="fld">Rename to
+          <div class="fe-row">
+            <input id="feRename" autocomplete="off" placeholder="new name">
+            <button type="button" id="feRenameBtn">Rename</button>
+          </div>
+        </label>
+        <label class="fld">Move under
+          <div class="fe-row">
+            <select id="feMove"></select>
+            <button type="button" id="feMoveBtn">Move</button>
+          </div>
+        </label>
+        <button type="button" class="fe-delete" id="feDeleteBtn">Delete folder</button>
+      </div>
     </aside>
 
     <nav class="sidebar">
@@ -741,6 +804,7 @@ function renderList() {
         <button class="ghost danger" data-del="${i}">Delete</button>
       </div></li>`;
   }).join('');
+  updateFolderEdit();
 }
 
 /* ---- Events ---- */
@@ -821,6 +885,63 @@ $('newFolderBtn').addEventListener('click', async () => {
   await load();
   filter = d.folder; $('f-folder').value = d.folder;
   renderSidebar(); renderList();
+});
+
+/* ---- Folder management panel (shown when a folder is selected) ---- */
+function updateFolderEdit() {
+  const isFolder = filter !== ALL && filter !== '';
+  $('folderEdit').style.display = isFolder ? 'grid' : 'none';
+  if (!isFolder) return;
+  $('feName').textContent = filter;
+  $('feRename').value = filter.split('/').pop();
+  // Move-target dropdown: root is always offered, plus every folder that is a
+  // valid destination (not this folder itself and not one of its descendants).
+  const parent = filter.split('/').slice(0, -1).join('/');
+  const opts = ['<option value="">(root)</option>'];
+  for (const f of folders) {
+    if (f === filter || f.startsWith(filter + '/')) continue;
+    opts.push(`<option value="${esc(f)}">${esc(f)}</option>`);
+  }
+  const sel = $('feMove');
+  sel.innerHTML = opts.join('');
+  sel.value = parent;   // preselect the current location ("" = root)
+}
+
+async function folderOp(url, body) {
+  const res = await fetch(url, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  });
+  const d = await res.json();
+  if (!res.ok) { alert(d.error || 'Folder operation failed.'); return null; }
+  return d;
+}
+
+$('feRenameBtn').addEventListener('click', async () => {
+  const name = $('feRename').value.trim();
+  if (!name || name === filter.split('/').pop()) return;
+  const d = await folderOp('/api/folders/rename', { folder: filter, name });
+  if (!d) return;
+  filter = d.folder;
+  if (!editingUrl) $('f-folder').value = filter;
+  await load();
+});
+
+$('feMoveBtn').addEventListener('click', async () => {
+  const parent = $('feMove').value;   // "" means root
+  const d = await folderOp('/api/folders/move', { folder: filter, parent });
+  if (!d) return;
+  filter = d.folder;
+  if (!editingUrl) $('f-folder').value = filter;
+  await load();
+});
+
+$('feDeleteBtn').addEventListener('click', async () => {
+  if (!confirm(`Delete folder "${filter}"?\\nBookmarks inside will be moved to "orphaned".`)) return;
+  const d = await folderOp('/api/folders/delete', { folder: filter });
+  if (!d) return;
+  filter = ALL;
+  await load();
 });
 
 $('fetchBtn').addEventListener('click', async () => {

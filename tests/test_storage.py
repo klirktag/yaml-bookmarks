@@ -205,6 +205,58 @@ def test_plaintext_and_encrypted_coexist(store):
     assert kinds == {"https://plain.example": False, "https://enc.example": True}
 
 
+def test_folder_ops_preserve_encrypted(store):
+    store.unlock("pw")
+    store.add("https://s.example", folder="work", encrypt=True, title="S")
+    store.rename_folder("work", "w2")
+    got = store.get("https://s.example", "w2")
+    assert got is not None and got.encrypted and got.title == "S"
+
+
+# -- folder management -------------------------------------------------------
+
+def test_rename_folder(store):
+    store.add("https://a.example", folder="work/ideas", title="A")
+    assert store.rename_folder("work/ideas", "concepts") == "work/concepts"
+    assert store.get("https://a.example", "work/concepts").folder == "work/concepts"
+    assert store.get("https://a.example", "work/ideas") is None
+
+
+def test_move_folder(store):
+    store.add("https://a.example", folder="work/ideas")
+    assert store.move_folder("work/ideas", "personal") == "personal/ideas"
+    assert store.get("https://a.example", "personal/ideas") is not None
+
+
+def test_move_folder_into_itself_rejected(store):
+    store.add("https://a.example", folder="work")
+    with pytest.raises(ValueError):
+        store.move_folder("work", "work")
+
+
+def test_rename_to_existing_folder_rejected(store):
+    store.add("https://a.example", folder="work/ideas")
+    store.create_folder("work/concepts")
+    with pytest.raises(ValueError):
+        store.rename_folder("work/ideas", "concepts")
+
+
+def test_delete_folder_orphans_bookmarks(store):
+    store.add("https://a.example", folder="work", title="A")
+    store.add("https://b.example", folder="work/sub", title="B")
+    assert store.delete_folder("work") == "orphaned"
+    assert store.get("https://a.example", "orphaned").title == "A"
+    # sub-path is preserved under orphaned/
+    assert store.get("https://b.example", "orphaned/sub").title == "B"
+    assert "work" not in store.folders()
+
+
+def test_delete_orphaned_folder_rejected(store):
+    store.create_folder("orphaned")
+    with pytest.raises(ValueError):
+        store.delete_folder("orphaned")
+
+
 def test_new_bookmarks_join_existing_vault_salt(store, tmp_path):
     store.unlock("pw")
     store.add("https://a.example", encrypt=True)
