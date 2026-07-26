@@ -11,7 +11,7 @@ from yaml_bookmarks.settings import (
 def test_defaults_when_missing(tmp_path):
     s = load_settings(tmp_path)
     assert s.port == 22222
-    assert s.allow_unencrypted is True
+    assert s.allow_unencrypted is False  # secure default: encryption required
 
 
 def test_ensure_creates_documented_file(tmp_path):
@@ -22,7 +22,7 @@ def test_ensure_creates_documented_file(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "port:" in text and "allow_unencrypted:" in text
     assert "#" in text  # comments present
-    assert s.port == 22222 and s.allow_unencrypted is True
+    assert s.port == 22222 and s.allow_unencrypted is False
 
 
 def test_reads_configured_values(tmp_path):

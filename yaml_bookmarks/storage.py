@@ -7,35 +7,36 @@
 # later version. See the COPYING.LESSER file for details.
 """Load, save, list and delete bookmarks stored as YAML files.
 
-Bookmark files live in the ``bookmarks/`` subfolder of the base directory
-(``settings.yaml`` and any future top-level files sit in the base dir itself).
-A bookmark's folder is simply *where its file lives* under the store directory —
-e.g. a bookmark in folder ``work/projects`` is the file
-``~/.yaml-bookmarks/bookmarks/work/projects/<escaped-url>.yaml``.  The filesystem
-is the single source of truth for folders, so the folder is derived from the path
-and is **not** written into the YAML itself.
+Storage is **flat**: every object is a ``<uuid>.yaml`` file directly in the
+``bookmarks/`` subfolder of the base dir. The folder a bookmark belongs to is
+**not** its location on disk — it is a ``path`` field *inside* the file. This
+decouples the collection layout from the filesystem, and (crucially) means an
+encrypted bookmark's folder lives *inside its ciphertext*: on disk it is just an
+opaque ``<uuid>.yaml`` with no folder names anywhere, so an encrypted vault can be
+committed to a public repo without leaking structure.
 
-Bookmarks may also be **encrypted** (see ``crypto.py`` and
-``docs/encryption.md``).  An encrypted bookmark is a file with ``crypt: true``, a
-random ``<uuid>.yaml`` name, and its whole record stored as one ciphertext blob.
-Encrypted bookmarks are invisible until the store is unlocked with the right
-password; once unlocked they behave like any other bookmark.
+Object kinds (told apart when read):
+
+* **Bookmark** — has a ``url`` (plus ``title``/``description``/``tags``/
+  ``created``) and a ``path`` (its folder, ``""`` = root).
+* **Folder** — ``type: folder`` plus a ``path``. Only needed to record an
+  *empty* folder; non-empty folders are inferred from the bookmarks' ``path``.
+
+Either kind can be encrypted: the file is then a ``crypt: true`` blob whose
+decrypted payload is the record above.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
 
 import yaml
 
 from . import crypto
 from .crypto import CryptoSession, is_encrypted, new_filename
-from .escaping import filename_for_url
 
 # The base directory holds settings.yaml (and any future top-level files); the
 # bookmarks themselves live in its "bookmarks/" subfolder.
@@ -45,14 +46,14 @@ DEFAULT_BASE_DIR = Path(
 )
 DEFAULT_STORE_DIR = DEFAULT_BASE_DIR / BOOKMARKS_SUBDIR
 
-# Characters/names that are unsafe as directory names across Windows/macOS/Linux.
+ORPHANED_FOLDER = "orphaned"
+FOLDER_TYPE = "folder"
+
+# Characters/names that are unsafe as folder-path segments across OSes.
 _ILLEGAL_CHARS = set('<>:"|?*\\') | {chr(c) for c in range(32)}
 _RESERVED_NAMES = {"con", "prn", "aux", "nul"} | {
     f"{p}{i}" for p in ("com", "lpt") for i in range(1, 10)
 }
-
-
-ORPHANED_FOLDER = "orphaned"
 
 
 class VaultLocked(Exception):
@@ -63,8 +64,8 @@ class EncryptionRequired(Exception):
     """Raised when adding an unencrypted bookmark while ``allow_unencrypted`` is off."""
 
 
-class _LockedBookmark(Exception):
-    """Internal: a file is encrypted and cannot be read in the current state."""
+class _Hidden(Exception):
+    """Internal: an encrypted object that can't be read in the current state."""
 
 
 def normalize_folder(folder: str | None) -> str:
@@ -97,20 +98,13 @@ def _now_unix() -> int:
     return int(_dt.datetime.now(_dt.timezone.utc).timestamp())
 
 
-# The always-present fields of a bookmark's persisted record. ``created`` (an
-# optional unix timestamp) is persisted only when set; folder/encrypted/path are
-# runtime-only and never written.
-_PAYLOAD_FIELDS = ("url", "title", "description", "tags")
-
-
 @dataclass
 class Bookmark:
     """A single bookmark.
 
-    ``created`` is an optional unix timestamp (whole seconds since the epoch) —
-    the moment the bookmark was created. It may be absent on older bookmarks that
-    predate the field. ``folder``/``encrypted``/``path`` are runtime-derived and
-    never persisted.
+    ``folder`` is the collection it lives in (persisted as the ``path`` field).
+    ``created`` is an optional unix timestamp. ``encrypted``/``file`` are runtime
+    only (whether it's stored encrypted, and its file on disk).
     """
 
     url: str
@@ -120,46 +114,77 @@ class Bookmark:
     folder: str = ""
     created: int | None = None
     encrypted: bool = False
-    path: str = ""
+    file: str = ""
 
     def payload(self) -> dict:
-        """The persisted record: core fields, plus ``created`` when set."""
-        d = {k: getattr(self, k) for k in _PAYLOAD_FIELDS}
+        """The record persisted to disk (or encrypted into the blob)."""
+        d = {
+            "url": self.url,
+            "title": self.title,
+            "description": self.description,
+            "tags": self.tags,
+            "path": self.folder,
+        }
         if self.created is not None:
             d["created"] = int(self.created)
         return d
 
     def to_dict(self) -> dict:
-        """For the JSON API: payload plus ``folder``, ``encrypted`` and ``created``."""
-        d = self.payload()
-        d["folder"] = self.folder
-        d["encrypted"] = self.encrypted
-        d["created"] = self.created
-        return d
+        """For the JSON API (keeps the user-facing ``folder`` name)."""
+        return {
+            "url": self.url,
+            "title": self.title,
+            "description": self.description,
+            "tags": self.tags,
+            "folder": self.folder,
+            "created": self.created,
+            "encrypted": self.encrypted,
+        }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Bookmark":
         if not data or "url" not in data:
-            raise ValueError("bookmark file is missing a 'url' field")
-        fields = {k: v for k, v in data.items() if k in _PAYLOAD_FIELDS}
+            raise ValueError("not a bookmark (no 'url')")
+        bm = cls(
+            url=data["url"],
+            title=data.get("title", "") or "",
+            description=data.get("description", "") or "",
+            tags=list(data.get("tags") or []),
+            folder=normalize_folder(data.get("path")),
+        )
         created = data.get("created")
         if created is not None:
             try:
-                fields["created"] = int(created)
+                bm.created = int(created)
             except (TypeError, ValueError):
                 pass
-        return cls(**fields)
+        return bm
+
+
+@dataclass
+class Folder:
+    """A folder marker — only needed to record an *empty* folder."""
+
+    folder: str = ""
+    encrypted: bool = False
+    file: str = ""
+
+    def payload(self) -> dict:
+        return {"type": FOLDER_TYPE, "path": self.folder}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Folder":
+        return cls(folder=normalize_folder(data.get("path")))
 
 
 class BookmarkStore:
-    """A directory tree full of bookmark YAML files (plaintext and encrypted)."""
+    """A flat directory of bookmark/folder objects (plaintext or encrypted)."""
 
     def __init__(self, directory: Path | str = DEFAULT_STORE_DIR):
         self.directory = Path(directory).expanduser()
         self._session: CryptoSession | None = None
-        # When False, adding a new *unencrypted* bookmark is rejected. Set from
-        # settings.yaml by the CLI / web entry points.
         self.allow_unencrypted: bool = True
+        self._entries: list | None = None  # in-memory cache of loaded objects
 
     # -- crypto session ------------------------------------------------------
 
@@ -168,16 +193,11 @@ class BookmarkStore:
         return self._session is not None
 
     def unlock(self, password: str) -> int:
-        """Engage *password*. Returns how many encrypted bookmarks it reveals.
-
-        The salt of the first matching file becomes the vault the user is in, so
-        newly encrypted bookmarks join it. If nothing matches, a fresh salt is
-        used for new bookmarks (i.e. starting a new vault).
-        """
+        """Engage *password*. Returns how many encrypted objects it reveals."""
         session = CryptoSession(password)
         count = 0
         active: bytes | None = None
-        for path in self._all_paths():
+        for path in self._files():
             data = self._load_yaml(path)
             if not is_encrypted(data):
                 continue
@@ -191,38 +211,21 @@ class BookmarkStore:
                         pass
         session.active_salt = active if active is not None else crypto.new_salt()
         self._session = session
+        self._invalidate()
         return count
 
     def lock(self) -> None:
         self._session = None
+        self._invalidate()
 
     def encrypted_file_count(self) -> int:
-        """Total number of encrypted files on disk, regardless of password."""
-        return sum(1 for p in self._all_paths() if is_encrypted(self._load_yaml(p)))
+        return sum(1 for p in self._files() if is_encrypted(self._load_yaml(p)))
 
-    # -- paths ---------------------------------------------------------------
+    # -- reading / cache -----------------------------------------------------
 
-    def _path_for(self, url: str, folder: str = "") -> Path:
-        """The plaintext file path for a URL (encrypted bookmarks use UUIDs)."""
-        folder = normalize_folder(folder)
-        base = self._folder_dir(folder)
-        return base / filename_for_url(url)
-
-    def _folder_dir(self, folder: str) -> Path:
-        folder = normalize_folder(folder)
-        return self.directory.joinpath(*folder.split("/")) if folder else self.directory
-
-    def _folder_of(self, path: Path) -> str:
-        rel = path.parent.relative_to(self.directory)
-        return "" if rel == Path(".") else rel.as_posix()
-
-    def _all_paths(self) -> Iterator[Path]:
-        # settings.yaml lives in the base dir, outside this bookmarks dir, so
-        # everything under here is a bookmark.
+    def _files(self):
         if self.directory.exists():
-            yield from self.directory.rglob("*.yaml")
-
-    # -- reading -------------------------------------------------------------
+            yield from self.directory.glob("*.yaml")  # flat
 
     @staticmethod
     def _load_yaml(path: Path):
@@ -232,33 +235,48 @@ class BookmarkStore:
         except (OSError, yaml.YAMLError):
             return None
 
-    def _read(self, path: Path) -> Bookmark:
+    def _read_obj(self, path: Path):
         data = self._load_yaml(path)
-        if data is None:
-            raise ValueError(f"could not read {path}")
+        if not isinstance(data, dict):
+            raise ValueError(f"not an object: {path.name}")
         if is_encrypted(data):
             if self._session is None:
-                raise _LockedBookmark
+                raise _Hidden
             payload = self._session.decrypt(data, aad=path.name.encode("utf-8"))
             if payload is None:
-                raise _LockedBookmark  # wrong password for this file
-            bookmark = Bookmark.from_dict(payload)
-            bookmark.encrypted = True
+                raise _Hidden  # wrong password for this file
+            encrypted = True
         else:
-            bookmark = Bookmark.from_dict(data)
-            bookmark.encrypted = False
-        bookmark.folder = self._folder_of(path)
-        bookmark.path = str(path)
-        return bookmark
+            payload = data
+            encrypted = False
+        if not isinstance(payload, dict):
+            raise ValueError("bad payload")
+        if payload.get("type") == FOLDER_TYPE:
+            obj = Folder.from_dict(payload)
+        elif "url" in payload:
+            obj = Bookmark.from_dict(payload)
+        else:
+            raise ValueError("unknown object kind")
+        obj.encrypted = encrypted
+        obj.file = str(path)
+        return obj
 
-    def _iter(self) -> Iterator[Bookmark]:
-        for path in self._all_paths():
-            try:
-                yield self._read(path)
-            except _LockedBookmark:
-                continue  # encrypted and locked (or wrong password): stay hidden
-            except (ValueError, yaml.YAMLError, OSError):
-                continue  # not a valid bookmark file
+    def _all(self) -> list:
+        if self._entries is None:
+            entries = []
+            for path in self._files():
+                try:
+                    entries.append(self._read_obj(path))
+                except (_Hidden, ValueError, yaml.YAMLError, OSError):
+                    continue  # encrypted+locked, or not a valid object
+            self._entries = entries
+        return self._entries
+
+    def _invalidate(self) -> None:
+        self._entries = None
+
+    def _bookmarks(self):
+        return [e for e in self._all() if isinstance(e, Bookmark)]
 
     # -- queries -------------------------------------------------------------
 
@@ -267,127 +285,25 @@ class BookmarkStore:
 
     def get(self, url: str, folder: str = "") -> Bookmark | None:
         folder = normalize_folder(folder)
-        plain = self._path_for(url, folder)
-        if plain.exists():
-            try:
-                bookmark = self._read(plain)
-                if not bookmark.encrypted:
-                    return bookmark
-            except (_LockedBookmark, ValueError, yaml.YAMLError, OSError):
-                pass
-        # Encrypted (UUID-named) bookmarks: scan the folder for a matching URL.
-        if self._session is not None:
-            path = self._find_encrypted_path(url, folder)
-            if path is not None:
-                return self._read(path)
-        return None
-
-    def _find_encrypted_path(self, url: str, folder: str) -> Path | None:
-        """Path of the encrypted bookmark for *url* in *folder* (needs a session)."""
-        if self._session is None:
-            return None
-        base = self._folder_dir(normalize_folder(folder))
-        if not base.exists():
-            return None
-        for path in base.glob("*.yaml"):
-            data = self._load_yaml(path)
-            if not is_encrypted(data):
-                continue
-            payload = self._session.decrypt(data, aad=path.name.encode("utf-8"))
-            if payload is not None and payload.get("url") == url:
-                return path
+        for b in self._bookmarks():
+            if b.url == url and b.folder == folder:
+                return b
         return None
 
     def list(self) -> list[Bookmark]:
         """All *visible* bookmarks, newest first (by ``created``; unknown last)."""
-        return sorted(
-            self._iter(),
-            key=lambda b: b.created or 0,
-            reverse=True,
-        )
+        return sorted(self._bookmarks(), key=lambda b: b.created or 0, reverse=True)
 
     def folders(self) -> list[str]:
-        """Every folder path under the store, including empty ones."""
+        """Every folder path, including ancestors and empty (Folder-object) ones."""
         result: set[str] = set()
-        if self.directory.exists():
-            for p in self.directory.rglob("*"):
-                if p.is_dir():
-                    result.add(p.relative_to(self.directory).as_posix())
+        for e in self._all():
+            if not e.folder:
+                continue
+            parts = e.folder.split("/")
+            for i in range(1, len(parts) + 1):
+                result.add("/".join(parts[:i]))
         return sorted(result)
-
-    # -- folder management ---------------------------------------------------
-
-    def create_folder(self, folder: str) -> str:
-        folder = normalize_folder(folder)
-        if folder:
-            self._folder_dir(folder).mkdir(parents=True, exist_ok=True)
-        return folder
-
-    def _relocate_folder(self, src: str, dst: str) -> str:
-        """Move the whole folder subtree from *src* to *dst* (keeps file names).
-
-        Since file names are preserved, encrypted bookmarks (filename-bound AAD)
-        keep working and nothing needs re-encrypting.
-        """
-        src = normalize_folder(src)
-        dst = normalize_folder(dst)
-        if not src:
-            raise ValueError("cannot move or rename the root folder")
-        if not dst:
-            raise ValueError("a destination folder is required")
-        if dst == src:
-            return dst
-        if dst.startswith(src + "/"):
-            raise ValueError("cannot move a folder into itself")
-        src_dir = self._folder_dir(src)
-        if not src_dir.exists():
-            raise FileNotFoundError(f"no such folder: {src!r}")
-        dst_dir = self._folder_dir(dst)
-        if dst_dir.exists():
-            raise ValueError(f"a folder {dst!r} already exists")
-        dst_dir.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(src_dir, dst_dir)
-        return dst
-
-    def rename_folder(self, folder: str, new_name: str) -> str:
-        """Rename a folder's own name, keeping it under the same parent."""
-        folder = normalize_folder(folder)
-        new_name = (new_name or "").strip()
-        if not new_name:
-            raise ValueError("a folder name is required")
-        parent = "/".join(folder.split("/")[:-1])
-        target = f"{parent}/{new_name}" if parent else new_name
-        return self._relocate_folder(folder, target)
-
-    def move_folder(self, folder: str, new_parent: str) -> str:
-        """Move a folder (keeping its own name) under *new_parent* ("" = root)."""
-        folder = normalize_folder(folder)
-        leaf = folder.split("/")[-1]
-        new_parent = normalize_folder(new_parent)
-        target = f"{new_parent}/{leaf}" if new_parent else leaf
-        return self._relocate_folder(folder, target)
-
-    def delete_folder(self, folder: str) -> str:
-        """Delete a folder, moving any bookmarks inside it to ``orphaned/``.
-
-        Bookmarks keep their sub-path relative to the deleted folder, so nothing
-        collides and nothing is lost. Returns the folder they were moved to.
-        """
-        folder = normalize_folder(folder)
-        if not folder:
-            raise ValueError("cannot delete the root folder")
-        if folder == ORPHANED_FOLDER or folder.startswith(ORPHANED_FOLDER + "/"):
-            raise ValueError(f"cannot delete the {ORPHANED_FOLDER!r} folder")
-        src_dir = self._folder_dir(folder)
-        if not src_dir.exists():
-            raise FileNotFoundError(f"no such folder: {folder!r}")
-        orphan_dir = self._folder_dir(ORPHANED_FOLDER)
-        for path in sorted(src_dir.rglob("*.yaml")):
-            dest = orphan_dir / path.relative_to(src_dir)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(path, dest)
-        shutil.rmtree(src_dir)
-        return ORPHANED_FOLDER
 
     # -- writing -------------------------------------------------------------
 
@@ -408,23 +324,32 @@ class BookmarkStore:
             data, sort_keys=False, allow_unicode=True, default_flow_style=False
         )
 
-    def _write_plaintext(self, bookmark: Bookmark, path: Path) -> None:
-        self._atomic_write(path, self._dump(bookmark.payload()))
-        bookmark.path = str(path)
-
-    def _write_encrypted(self, bookmark: Bookmark, path: Path | None = None) -> None:
-        session = self._require_session()
-        if path is None:
-            base = self._folder_dir(bookmark.folder)
-            base.mkdir(parents=True, exist_ok=True)
-            path = base / new_filename()
+    def _write_object(self, obj) -> None:
+        """Write a Bookmark/Folder to its file (new UUID file if it has none)."""
+        if obj.file:
+            path = Path(obj.file)
+        else:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            path = self.directory / new_filename()
             while path.exists():
-                path = base / new_filename()
-        data = session.encrypt(
-            bookmark.payload(), aad=path.name.encode("utf-8"), salt=session.active_salt
-        )
+                path = self.directory / new_filename()
+        if obj.encrypted:
+            session = self._require_session()
+            data = session.encrypt(
+                obj.payload(), aad=path.name.encode("utf-8"), salt=session.active_salt
+            )
+        else:
+            data = obj.payload()
         self._atomic_write(path, self._dump(data))
-        bookmark.path = str(path)
+        obj.file = str(path)
+
+    def _cache_append(self, obj) -> None:
+        if self._entries is not None:
+            self._entries.append(obj)
+
+    def _cache_drop(self, files: set) -> None:
+        if self._entries is not None:
+            self._entries = [e for e in self._entries if e.file not in files]
 
     # -- mutations -----------------------------------------------------------
 
@@ -439,13 +364,18 @@ class BookmarkStore:
         tags: list[str] | None = None,
         created: int | None = None,
     ) -> Bookmark:
-        """Create a new bookmark. Raises if one already exists at that folder.
-
-        ``created`` defaults to the current time (unix seconds); pass a value to
-        preserve an original creation time (e.g. when importing).
-        """
+        """Create a new bookmark. Raises if one already exists at that folder."""
         folder = normalize_folder(folder)
-        bookmark = Bookmark(
+        if self.get(url, folder) is not None:
+            where = f"{folder}/" if folder else "the root folder"
+            raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
+        if not encrypt and not self.allow_unencrypted:
+            raise EncryptionRequired(
+                "unencrypted bookmarks are not allowed (allow_unencrypted is false)"
+            )
+        if encrypt:
+            self._require_session()
+        bm = Bookmark(
             url=url,
             title=title,
             description=description,
@@ -454,23 +384,9 @@ class BookmarkStore:
             created=created if created is not None else _now_unix(),
             encrypted=encrypt,
         )
-        if encrypt:
-            self._require_session()
-            if self._find_encrypted_path(url, folder) is not None:
-                where = f"{folder}/" if folder else "the root folder"
-                raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
-            self._write_encrypted(bookmark)
-        else:
-            if not self.allow_unencrypted:
-                raise EncryptionRequired(
-                    "unencrypted bookmarks are not allowed (allow_unencrypted is false)"
-                )
-            path = self._path_for(url, folder)
-            if path.exists():
-                where = f"{folder}/" if folder else "the root folder"
-                raise FileExistsError(f"a bookmark already exists for {url!r} in {where}")
-            self._write_plaintext(bookmark, path)
-        return bookmark
+        self._write_object(bm)
+        self._cache_append(bm)
+        return bm
 
     def update(
         self,
@@ -482,83 +398,136 @@ class BookmarkStore:
         tags: list[str] | None = None,
     ) -> Bookmark:
         """Update fields of an existing bookmark. Only passed fields change."""
-        bookmark = self.get(url, normalize_folder(folder))
-        if bookmark is None:
+        bm = self.get(url, normalize_folder(folder))
+        if bm is None:
             raise FileNotFoundError(f"no bookmark found for {url!r} in folder {folder!r}")
         if title is not None:
-            bookmark.title = title
+            bm.title = title
         if description is not None:
-            bookmark.description = description
+            bm.description = description
         if tags is not None:
-            bookmark.tags = list(tags)
-        if bookmark.encrypted:
-            self._write_encrypted(bookmark, path=Path(bookmark.path))
-        else:
-            self._write_plaintext(bookmark, Path(bookmark.path))
-        return bookmark
+            bm.tags = list(tags)
+        self._write_object(bm)  # same file (cached object mutated in place)
+        return bm
 
     def save(self, bookmark: Bookmark, *, encrypt: bool = False) -> Bookmark:
-        """Create or overwrite a bookmark (upsert).
-
-        An existing bookmark keeps its kind (encrypted or plaintext); a brand-new
-        one is encrypted iff *encrypt* is true.
-        """
+        """Create or overwrite a bookmark (upsert on ``(folder, url)``)."""
         bookmark.folder = normalize_folder(bookmark.folder)
         existing = self.get(bookmark.url, bookmark.folder)
-        if bookmark.created is None:
-            bookmark.created = existing.created if existing else _now_unix()
         if existing is not None:
-            use_encrypt = existing.encrypted
-            existing_path: Path | None = Path(existing.path)
-        else:
-            use_encrypt = encrypt
-            existing_path = None
-        if existing is None and not use_encrypt and not self.allow_unencrypted:
+            existing.title = bookmark.title
+            existing.description = bookmark.description
+            existing.tags = list(bookmark.tags)
+            if bookmark.created is not None:
+                existing.created = bookmark.created
+            self._write_object(existing)
+            return existing
+        if not encrypt and not self.allow_unencrypted:
             raise EncryptionRequired(
                 "unencrypted bookmarks are not allowed (allow_unencrypted is false)"
             )
-        bookmark.encrypted = use_encrypt
-        if use_encrypt:
+        if encrypt:
             self._require_session()
-            self._write_encrypted(bookmark, path=existing_path)
-        else:
-            self._write_plaintext(
-                bookmark, existing_path or self._path_for(bookmark.url, bookmark.folder)
-            )
+        bookmark.encrypted = encrypt
+        bookmark.file = ""
+        if bookmark.created is None:
+            bookmark.created = _now_unix()
+        self._write_object(bookmark)
+        self._cache_append(bookmark)
         return bookmark
 
     def move(self, url: str, src_folder: str, dst_folder: str) -> Bookmark:
-        """Move a bookmark from one folder to another, keeping its content."""
-        src_folder = normalize_folder(src_folder)
-        dst_folder = normalize_folder(dst_folder)
-        bookmark = self.get(url, src_folder)
-        if bookmark is None:
+        """Move a bookmark to another folder (rewrites its ``path`` field)."""
+        bm = self.get(url, normalize_folder(src_folder))
+        if bm is None:
             raise FileNotFoundError(f"no bookmark found for {url!r} in folder {src_folder!r}")
-        src_path = Path(bookmark.path)
-        bookmark.folder = dst_folder
-        if bookmark.encrypted:
-            # Keep the same UUID file name so the filename-as-AAD stays valid.
-            dst_dir = self._folder_dir(dst_folder)
-            dst_dir.mkdir(parents=True, exist_ok=True)
-            dst_path = dst_dir / src_path.name
-            self._write_encrypted(bookmark, path=dst_path)
-        else:
-            dst_path = self._path_for(url, dst_folder)
-            self._write_plaintext(bookmark, dst_path)
-        if src_path.resolve() != Path(bookmark.path).resolve():
-            src_path.unlink()
-        return bookmark
+        if bm.encrypted:
+            self._require_session()
+        bm.folder = normalize_folder(dst_folder)
+        self._write_object(bm)  # same file, re-encrypted with a fresh nonce
+        return bm
 
     def remove(self, url: str, folder: str = "") -> bool:
-        """Delete a bookmark (plaintext or encrypted). True if a file was removed."""
+        """Delete a bookmark. Returns True if one was removed."""
+        bm = self.get(url, normalize_folder(folder))
+        if bm is None:
+            return False
+        Path(bm.file).unlink(missing_ok=True)
+        self._cache_drop({bm.file})
+        return True
+
+    # -- folder management ---------------------------------------------------
+
+    def create_folder(self, folder: str) -> str:
+        """Record an (empty) folder via a Folder object. No-op if it exists."""
         folder = normalize_folder(folder)
-        plain = self._path_for(url, folder)
-        if plain.exists():
-            plain.unlink()
-            return True
-        if self._session is not None:
-            enc = self._find_encrypted_path(url, folder)
-            if enc is not None:
-                enc.unlink()
-                return True
-        return False
+        if not folder or folder in set(self.folders()):
+            return folder
+        encrypt = self._session is not None
+        if not encrypt and not self.allow_unencrypted:
+            raise EncryptionRequired(
+                "unencrypted folders are not allowed (allow_unencrypted is false)"
+            )
+        fo = Folder(folder=folder, encrypted=encrypt)
+        self._write_object(fo)
+        self._cache_append(fo)
+        return folder
+
+    def _reprefix(self, src: str, dst: str) -> str:
+        src = normalize_folder(src)
+        dst = normalize_folder(dst)
+        if not src:
+            raise ValueError("cannot move or rename the root folder")
+        if not dst:
+            raise ValueError("a destination folder is required")
+        if dst == src:
+            return dst
+        if dst.startswith(src + "/"):
+            raise ValueError("cannot move a folder into itself")
+        if dst in set(self.folders()):
+            raise ValueError(f"a folder {dst!r} already exists")
+        for e in self._all():
+            if e.folder == src or e.folder.startswith(src + "/"):
+                e.folder = dst + e.folder[len(src):]
+                if e.encrypted:
+                    self._require_session()
+                self._write_object(e)
+        return dst
+
+    def rename_folder(self, folder: str, new_name: str) -> str:
+        folder = normalize_folder(folder)
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("a folder name is required")
+        parent = "/".join(folder.split("/")[:-1])
+        target = f"{parent}/{new_name}" if parent else new_name
+        return self._reprefix(folder, target)
+
+    def move_folder(self, folder: str, new_parent: str) -> str:
+        folder = normalize_folder(folder)
+        leaf = folder.split("/")[-1]
+        new_parent = normalize_folder(new_parent)
+        target = f"{new_parent}/{leaf}" if new_parent else leaf
+        return self._reprefix(folder, target)
+
+    def delete_folder(self, folder: str) -> str:
+        """Delete a folder: bookmarks inside move to ``orphaned/``; markers go."""
+        folder = normalize_folder(folder)
+        if not folder:
+            raise ValueError("cannot delete the root folder")
+        if folder == ORPHANED_FOLDER or folder.startswith(ORPHANED_FOLDER + "/"):
+            raise ValueError(f"cannot delete the {ORPHANED_FOLDER!r} folder")
+        dropped: set = set()
+        for e in list(self._all()):
+            if not (e.folder == folder or e.folder.startswith(folder + "/")):
+                continue
+            if isinstance(e, Bookmark):
+                e.folder = ORPHANED_FOLDER + e.folder[len(folder):]
+                if e.encrypted:
+                    self._require_session()
+                self._write_object(e)
+            else:  # a Folder marker under the deleted folder — remove it
+                Path(e.file).unlink(missing_ok=True)
+                dropped.add(e.file)
+        self._cache_drop(dropped)
+        return ORPHANED_FOLDER

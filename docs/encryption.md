@@ -121,18 +121,19 @@ No flag ⇒ it's a plaintext bookmark. That single flag is the only thing the
 reader needs to check; all other encryption fields are optional and present only
 on encrypted files.
 
-A **plaintext** bookmark is unchanged from today — no encryption fields:
+A **plaintext** bookmark — a flat `<uuid4>.yaml` file, no encryption fields:
 
 ```yaml
 url: https://example.com
 title: Example
 description: ...
 tags: [a, b]
+path: work/ideas      # the folder ("" = root)
 created: 1769380888   # optional unix timestamp (seconds)
 ```
 
-An **encrypted** bookmark has filename `<uuid4>.yaml` (random, leaks nothing) and
-looks like:
+An **encrypted** bookmark has the same `<uuid4>.yaml` filename (random, leaks
+nothing) and looks like:
 
 ```yaml
 crypt: true                      # the only signal that this file is encrypted
@@ -145,15 +146,18 @@ ciphertext: <base64>            # AEAD-encrypts the whole payload below
 ```
 
 The plaintext that gets encrypted into `ciphertext` is exactly the normal record
-shown above (url, title, description, tags, and optional `created`).
+shown above (url, title, description, tags, the `path` folder, and optional
+`created`).
 
 Notes:
 
-- **Encrypt everything**, including the `created` timestamp — a plaintext date
-  would leak activity patterns. The folder (per the existing model)
-  is still expressed by the file's directory location, which is *not* encrypted;
-  users who consider folder names sensitive should keep encrypted bookmarks at
-  the root or in innocuously named folders.
+- **Encrypt everything**, including the `path` (folder) and the `created`
+  timestamp. Because storage is **flat** (every object is a `<uuid>.yaml` file
+  with the folder held in its `path` field), the folder of an encrypted bookmark
+  lives *inside the ciphertext*. On disk an encrypted vault is just a pile of
+  opaque `<uuid>.yaml` files — **no folder names or structure anywhere** — so it
+  can be committed to a public repo without leaking your collections. (Empty
+  encrypted folders are encrypted `type: folder` objects, equally opaque.)
 - **Bind the filename as AEAD associated data (AAD).** This stops a ciphertext
   from being copied into a different file and silently accepted.
 - **No central verifier needed for correctness.** The AEAD authentication tag is
@@ -289,8 +293,11 @@ keep the KDF in the standard library.
   [Visibility and unlocking](#visibility-and-unlocking). The held master key is
   what flips that behaviour; the web UI keeps it in server memory for the session,
   the CLI obtains it via `getpass` (optionally a short-lived agent).
-- `folders()` still works — folder membership is the directory path, which is not
-  encrypted.
+- `folders()` reconstructs the tree from each object's `path` field, so while
+  locked it only reflects the visible (plaintext) objects; an encrypted vault's
+  folders appear once unlocked. Folder rename/move/delete rewrite the `path` of
+  affected objects (re-encrypting encrypted ones), so they need an unlocked vault
+  when encrypted objects are involved.
 
 ## Open questions (for whenever this is built)
 

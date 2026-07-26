@@ -19,6 +19,7 @@ from .storage import (
     BookmarkStore,
     DEFAULT_STORE_DIR,
     EncryptionRequired,
+    Folder,
     VaultLocked,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     "BookmarkStore",
     "DEFAULT_STORE_DIR",
     "EncryptionRequired",
+    "Folder",
     "VaultLocked",
     "Settings",
     "load_settings",

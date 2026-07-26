@@ -82,19 +82,20 @@ def test_bad_file_is_skipped(store, tmp_path):
 
 # -- folders -----------------------------------------------------------------
 
-def test_add_in_folder_creates_nested_dir(store, tmp_path):
+def test_storage_is_flat_no_subdirs(store, tmp_path):
     store.add("https://example.com", folder="work/projects", title="P")
-    f = tmp_path / "work" / "projects"
-    assert f.is_dir()
-    assert len(list(f.glob("*.yaml"))) == 1
+    # No folder directories are created — everything is a flat file.
+    assert not (tmp_path / "work").exists()
+    files = list(tmp_path.glob("*.yaml"))
+    assert len(files) == 1
     b = store.get("https://example.com", folder="work/projects")
     assert b.folder == "work/projects" and b.title == "P"
 
 
-def test_folder_not_stored_in_yaml(store, tmp_path):
+def test_folder_is_stored_as_path_field(store, tmp_path):
     store.add("https://example.com", folder="work")
-    text = next((tmp_path / "work").glob("*.yaml")).read_text(encoding="utf-8")
-    assert "folder:" not in text  # location is the source of truth
+    text = next(tmp_path.glob("*.yaml")).read_text(encoding="utf-8")
+    assert "path: work" in text  # the folder lives inside the file now
 
 
 def test_same_url_in_different_folders(store):
@@ -128,6 +129,23 @@ def test_folders_lists_tree_including_empty(store):
     store.add("https://example.com", folder="a/b")
     store.create_folder("empty/child")
     assert set(store.folders()) == {"a", "a/b", "empty", "empty/child"}
+
+
+def test_empty_folder_persists_via_folder_object(store, tmp_path):
+    store.create_folder("standalone")
+    # It's a real Folder object on disk (type: folder), and a fresh store sees it.
+    text = next(tmp_path.glob("*.yaml")).read_text(encoding="utf-8")
+    assert "type: folder" in text and "path: standalone" in text
+    from yaml_bookmarks.storage import BookmarkStore
+    assert "standalone" in BookmarkStore(tmp_path).folders()
+    assert store.list() == []  # a folder object is not a bookmark
+
+
+def test_deep_flat_layout_reconstructs_tree(store, tmp_path):
+    store.add("https://x.example", folder="a/b/c")
+    # Single flat file, but the whole ancestor tree is reconstructed from `path`.
+    assert len(list(tmp_path.glob("*.yaml"))) == 1
+    assert set(store.folders()) == {"a", "a/b", "a/b/c"}
 
 
 def test_normalize_folder_rejects_traversal():
@@ -172,13 +190,22 @@ def test_encrypted_hidden_until_unlock(store):
 
 def test_encrypted_file_is_opaque_on_disk(store, tmp_path):
     store.unlock("pw")
-    store.add("https://secret.example/path", encrypt=True, title="T", tags=["k"])
+    store.add(
+        "https://secret.example/path",
+        encrypt=True,
+        title="T",
+        tags=["k"],
+        folder="TopSecretProject",
+    )
     files = list(tmp_path.rglob("*.yaml"))
     assert len(files) == 1
+    # A flat uuid file, no folder directory.
+    assert files[0].parent == tmp_path
     text = files[0].read_text(encoding="utf-8")
     assert "crypt: true" in text
-    assert "secret.example" not in text     # url not leaked
-    assert "url:" not in text and "title:" not in text
+    assert "secret.example" not in text        # url not leaked
+    assert "TopSecretProject" not in text      # folder name not leaked either
+    assert "url:" not in text and "path:" not in text
 
 
 def test_wrong_password_reveals_nothing(store):

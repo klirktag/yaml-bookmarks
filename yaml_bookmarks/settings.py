@@ -26,7 +26,7 @@ DEFAULT_PORT = 22222
 @dataclass
 class Settings:
     port: int = DEFAULT_PORT
-    allow_unencrypted: bool = True
+    allow_unencrypted: bool = False
 
 
 _TEMPLATE = """\
@@ -36,9 +36,10 @@ _TEMPLATE = """\
 # Port the web UI (`yaml-bookmarks web`) listens on.
 port: 22222
 
-# If false, every new bookmark must be encrypted: adding an unencrypted bookmark
-# is rejected. Existing unencrypted bookmarks are left untouched.
-allow_unencrypted: true
+# Whether plaintext (unencrypted) bookmarks are allowed. The default is false:
+# every new bookmark must be encrypted, and adding an unencrypted one is rejected.
+# Set this to true to allow plaintext bookmarks.
+allow_unencrypted: false
 """
 
 
@@ -77,7 +78,7 @@ def load_settings(directory: Path | str) -> Settings:
             data = {}
     return Settings(
         port=_coerce_port(data.get("port", DEFAULT_PORT)),
-        allow_unencrypted=_coerce_bool(data.get("allow_unencrypted"), True),
+        allow_unencrypted=_coerce_bool(data.get("allow_unencrypted"), False),
     )
 
 

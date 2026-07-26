@@ -70,40 +70,54 @@ Example: `https://example.com/Path` → `https_3A_2F_2Fexample.com_2F_50ath.yaml
 
 ## Storage model (`storage.py`)
 
-`Bookmark` is a dataclass: `url`, `title`, `description`, `tags`, `folder`,
-and an optional `created` (unix timestamp, seconds; absent on bookmarks that
-predate the field). Auto-set to now on add; the importer fills it from the
-source. Bookmarks are listed newest-`created` first.
+**Storage is flat.** Every object is a `<uuid>.yaml` file directly in the store
+dir — there are **no folder subdirectories**. A bookmark's folder is a **`path`
+field inside the file**, not its location on disk. This decouples the collection
+layout from the filesystem and (crucially) means an encrypted bookmark's folder
+lives *inside its ciphertext* — see the Encryption section for why that matters
+for committing a vault to a public repo.
 
-- `folder` is a runtime attribute **derived from the file's location**;
-  `to_yaml_dict()` drops it before writing, `to_dict()` keeps it (for the JSON
-  API), and `_read()` sets it from the path so location always wins.
-- The **base** directory is `$HOME/.yaml-bookmarks` (holds `settings.yaml` and
-  any future top-level files); the **store** directory — where bookmark files and
-  collection folders live — is its `bookmarks/` subfolder,
-  `$HOME/.yaml-bookmarks/bookmarks`. `YAML_BOOKMARKS_DIR` / CLI `--dir` set the
-  *base*; `BookmarkStore(directory)` takes the *store* dir directly.
+Two object kinds, told apart when read:
 
-`BookmarkStore` methods:
+- **`Bookmark`** — `url`, `title`, `description`, `tags`, `folder` (persisted as
+  the `path` field, `""` = root), optional `created` (unix seconds, auto-set on
+  add, filled from source on import). `encrypted`/`file` are runtime only.
+- **`Folder`** — `type: folder` + a `path`. Only needed to record an **empty**
+  folder; non-empty folders are inferred from the bookmarks' `path`. Having a
+  Folder object for a non-empty folder is allowed but not required.
+
+Directories:
+
+- **base** = `$HOME/.yaml-bookmarks` (holds `settings.yaml` + future top-level
+  files); **store** = its `bookmarks/` subfolder. `YAML_BOOKMARKS_DIR` / CLI
+  `--dir` set the *base*; `BookmarkStore(directory)` takes the *store* dir.
+
+The store keeps an **in-memory cache** of loaded objects (`self._entries`) so
+lookups are O(1) after the first scan; it's maintained incrementally on writes
+and invalidated on unlock/lock (encrypted objects appear/disappear).
+
+`BookmarkStore` methods (folder is the logical `path`):
 
 | Method | Notes |
 |---|---|
-| `add(url, folder=, title=, description=, tags=)` | raises `FileExistsError` if it already exists at that folder |
-| `update(url, folder=, ...)` | only the fields you pass change; raises `FileNotFoundError` if missing |
-| `save(bookmark)` | upsert at `bookmark.folder`; preserves/auto-sets `created` |
-| `move(url, src_folder, dst_folder)` | relocates the file, preserving content & `created` |
-| `remove(url, folder=)` | returns `True` if a file was deleted |
-| `get(url, folder=)` / `exists(...)` | single lookup at an exact folder |
-| `list()` | all bookmarks, recursive, most-recently-updated first |
-| `folders()` | every folder path (incl. empty ones), from directory tree |
-| `create_folder(folder)` | `mkdir -p` an empty collection |
+| `add(url, folder=, encrypt=, …, created=)` | new bookmark; `FileExistsError` if `(folder,url)` exists |
+| `update(url, folder=, …)` | only passed fields change |
+| `save(bookmark, encrypt=)` | upsert on `(folder, url)`; preserves/auto-sets `created` |
+| `move(url, src, dst)` | rewrites the `path` field (same file; re-encrypts if encrypted) |
+| `remove(url, folder=)` | `True` if removed |
+| `get` / `exists` | match by `(folder, url)` in the cache |
+| `list()` | bookmarks only, newest-`created` first |
+| `folders()` | all folder paths incl. ancestors + empty (Folder-object) ones |
+| `create_folder(folder)` | writes a Folder object for an empty folder |
+| `rename_folder` / `move_folder` / `delete_folder` | rewrite the `path` prefix of affected objects (delete → orphaned/) |
 
-Because folder is part of the on-disk location, the identity of a bookmark is
-**(folder, url)** — the same URL may exist in more than one folder, and `move`
-needs both the source and destination folder.
+Identity is **(folder, url)** — the same URL may exist in more than one folder.
+Folder operations rewrite each affected object's `path` (re-encrypting encrypted
+ones), so they require an unlocked vault when encrypted objects are involved.
 
-Writes are atomic (`*.yaml.tmp` + `os.replace`). `list()`/`_iter()` skip files
-that don't parse as bookmarks rather than crashing.
+Writes are atomic (`*.yaml.tmp` + `os.replace`); unreadable/undecryptable files
+are skipped rather than crashing. (`escaping.py` is retained as a utility but is
+no longer used for filenames — all files are UUIDs now.)
 
 ### Folder validation — `normalize_folder(folder)`
 
@@ -217,10 +231,14 @@ Because it sits outside the store dir, it is never seen by the bookmark scanner.
 Current keys:
 
 - `port` — web UI port (explicit `--port` overrides it).
-- `allow_unencrypted` — when `false`, adding a *new* unencrypted bookmark raises
+- `allow_unencrypted` — **defaults to `false`** (secure default: a fresh install
+  requires encryption). When `false`, adding a *new* unencrypted bookmark raises
   `EncryptionRequired` (`storage.py`); editing existing plaintext bookmarks is
   still allowed. Enforced in `BookmarkStore.add`/`save` via
   `store.allow_unencrypted`, surfaced in the web `/api/status` and as a hint.
+  (Note: `BookmarkStore.allow_unencrypted` itself defaults to `True` for direct
+  library/test use; the app always sets it from settings, whose default is
+  `false`.)
 
 ## Encryption
 
@@ -234,6 +252,8 @@ source of truth and update it whenever the encryption behaviour changes.
 
 ## Data format
 
+A **bookmark** file (`<uuid>.yaml`, flat):
+
 ```yaml
 url: https://example.com
 title: Example
@@ -241,11 +261,19 @@ description: A description
 tags:
 - web
 - reference
+path: work/ideas      # the folder ("" = root)
 created: 1769380888   # optional unix timestamp (seconds); omitted if unset
 ```
 
-There is intentionally **no `folder:` key** — the folder is the directory the
-file sits in.
+A **folder** object (only for empty folders):
+
+```yaml
+type: folder
+path: work/ideas
+```
+
+Encrypted objects instead hold a `crypt: true` blob whose decrypted payload is
+one of the above.
 
 ## Running, installing, testing
 
