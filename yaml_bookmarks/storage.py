@@ -7,12 +7,13 @@
 # later version. See the COPYING.LESSER file for details.
 """Load, save, list and delete bookmarks stored as YAML files.
 
-Bookmarks may be organised into folders and subfolders.  A bookmark's folder is
-simply *where its file lives* under the store directory — e.g. a bookmark in
-folder ``work/projects`` is the file
-``~/.yaml-bookmarks/work/projects/<escaped-url>.yaml``.  The filesystem is the
-single source of truth for folders, so the folder is derived from the path and
-is **not** written into the YAML itself.
+Bookmark files live in the ``bookmarks/`` subfolder of the base directory
+(``settings.yaml`` and any future top-level files sit in the base dir itself).
+A bookmark's folder is simply *where its file lives* under the store directory —
+e.g. a bookmark in folder ``work/projects`` is the file
+``~/.yaml-bookmarks/bookmarks/work/projects/<escaped-url>.yaml``.  The filesystem
+is the single source of truth for folders, so the folder is derived from the path
+and is **not** written into the YAML itself.
 
 Bookmarks may also be **encrypted** (see ``crypto.py`` and
 ``docs/encryption.md``).  An encrypted bookmark is a file with ``crypt: true``, a
@@ -23,7 +24,6 @@ password; once unlocked they behave like any other bookmark.
 
 from __future__ import annotations
 
-import dataclasses
 import datetime as _dt
 import os
 import shutil
@@ -36,11 +36,14 @@ import yaml
 from . import crypto
 from .crypto import CryptoSession, is_encrypted, new_filename
 from .escaping import filename_for_url
-from .settings import SETTINGS_FILENAME
 
-DEFAULT_STORE_DIR = Path(
+# The base directory holds settings.yaml (and any future top-level files); the
+# bookmarks themselves live in its "bookmarks/" subfolder.
+BOOKMARKS_SUBDIR = "bookmarks"
+DEFAULT_BASE_DIR = Path(
     os.environ.get("YAML_BOOKMARKS_DIR", Path.home() / ".yaml-bookmarks")
 )
+DEFAULT_STORE_DIR = DEFAULT_BASE_DIR / BOOKMARKS_SUBDIR
 
 # Characters/names that are unsafe as directory names across Windows/macOS/Linux.
 _ILLEGAL_CHARS = set('<>:"|?*\\') | {chr(c) for c in range(32)}
@@ -89,47 +92,63 @@ def normalize_folder(folder: str | None) -> str:
     return "/".join(parts)
 
 
-def _now() -> str:
-    """Current UTC time as an ISO-8601 string (seconds precision)."""
-    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+def _now_unix() -> int:
+    """Current time as a unix timestamp (whole seconds since the epoch)."""
+    return int(_dt.datetime.now(_dt.timezone.utc).timestamp())
 
 
-# The fields that make up a bookmark's persisted record (plaintext YAML body, or
-# the plaintext that gets encrypted). Folder/encrypted/path are runtime-only.
-_PAYLOAD_FIELDS = ("url", "title", "description", "tags", "created_at", "updated_at")
+# The always-present fields of a bookmark's persisted record. ``created`` (an
+# optional unix timestamp) is persisted only when set; folder/encrypted/path are
+# runtime-only and never written.
+_PAYLOAD_FIELDS = ("url", "title", "description", "tags")
 
 
 @dataclass
 class Bookmark:
-    """A single bookmark. ``folder``/``encrypted``/``path`` are runtime-derived."""
+    """A single bookmark.
+
+    ``created`` is an optional unix timestamp (whole seconds since the epoch) —
+    the moment the bookmark was created. It may be absent on older bookmarks that
+    predate the field. ``folder``/``encrypted``/``path`` are runtime-derived and
+    never persisted.
+    """
 
     url: str
     title: str = ""
     description: str = ""
     tags: list[str] = field(default_factory=list)
     folder: str = ""
-    created_at: str = ""
-    updated_at: str = ""
+    created: int | None = None
     encrypted: bool = False
     path: str = ""
 
     def payload(self) -> dict:
-        """The persisted record: the core fields only (no folder/encrypted/path)."""
-        d = dataclasses.asdict(self)
-        return {k: d[k] for k in _PAYLOAD_FIELDS}
+        """The persisted record: core fields, plus ``created`` when set."""
+        d = {k: getattr(self, k) for k in _PAYLOAD_FIELDS}
+        if self.created is not None:
+            d["created"] = int(self.created)
+        return d
 
     def to_dict(self) -> dict:
-        """For the JSON API: payload plus ``folder`` and ``encrypted``."""
+        """For the JSON API: payload plus ``folder``, ``encrypted`` and ``created``."""
         d = self.payload()
         d["folder"] = self.folder
         d["encrypted"] = self.encrypted
+        d["created"] = self.created
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "Bookmark":
         if not data or "url" not in data:
             raise ValueError("bookmark file is missing a 'url' field")
-        return cls(**{k: v for k, v in data.items() if k in _PAYLOAD_FIELDS})
+        fields = {k: v for k, v in data.items() if k in _PAYLOAD_FIELDS}
+        created = data.get("created")
+        if created is not None:
+            try:
+                fields["created"] = int(created)
+            except (TypeError, ValueError):
+                pass
+        return cls(**fields)
 
 
 class BookmarkStore:
@@ -198,13 +217,10 @@ class BookmarkStore:
         return "" if rel == Path(".") else rel.as_posix()
 
     def _all_paths(self) -> Iterator[Path]:
-        if not self.directory.exists():
-            return
-        settings_file = self.directory / SETTINGS_FILENAME
-        for path in self.directory.rglob("*.yaml"):
-            if path == settings_file:
-                continue  # the global settings file is not a bookmark
-            yield path
+        # settings.yaml lives in the base dir, outside this bookmarks dir, so
+        # everything under here is a bookmark.
+        if self.directory.exists():
+            yield from self.directory.rglob("*.yaml")
 
     # -- reading -------------------------------------------------------------
 
@@ -283,10 +299,10 @@ class BookmarkStore:
         return None
 
     def list(self) -> list[Bookmark]:
-        """All *visible* bookmarks (encrypted ones only when unlocked)."""
+        """All *visible* bookmarks, newest first (by ``created``; unknown last)."""
         return sorted(
             self._iter(),
-            key=lambda b: b.updated_at or b.created_at,
+            key=lambda b: b.created or 0,
             reverse=True,
         )
 
@@ -421,18 +437,21 @@ class BookmarkStore:
         title: str = "",
         description: str = "",
         tags: list[str] | None = None,
+        created: int | None = None,
     ) -> Bookmark:
-        """Create a new bookmark. Raises if one already exists at that folder."""
+        """Create a new bookmark. Raises if one already exists at that folder.
+
+        ``created`` defaults to the current time (unix seconds); pass a value to
+        preserve an original creation time (e.g. when importing).
+        """
         folder = normalize_folder(folder)
-        now = _now()
         bookmark = Bookmark(
             url=url,
             title=title,
             description=description,
             tags=list(tags or []),
             folder=folder,
-            created_at=now,
-            updated_at=now,
+            created=created if created is not None else _now_unix(),
             encrypted=encrypt,
         )
         if encrypt:
@@ -472,7 +491,6 @@ class BookmarkStore:
             bookmark.description = description
         if tags is not None:
             bookmark.tags = list(tags)
-        bookmark.updated_at = _now()
         if bookmark.encrypted:
             self._write_encrypted(bookmark, path=Path(bookmark.path))
         else:
@@ -487,10 +505,8 @@ class BookmarkStore:
         """
         bookmark.folder = normalize_folder(bookmark.folder)
         existing = self.get(bookmark.url, bookmark.folder)
-        now = _now()
-        if not bookmark.created_at:
-            bookmark.created_at = existing.created_at if existing else now
-        bookmark.updated_at = now
+        if bookmark.created is None:
+            bookmark.created = existing.created if existing else _now_unix()
         if existing is not None:
             use_encrypt = existing.encrypted
             existing_path: Path | None = Path(existing.path)
@@ -520,7 +536,6 @@ class BookmarkStore:
             raise FileNotFoundError(f"no bookmark found for {url!r} in folder {src_folder!r}")
         src_path = Path(bookmark.path)
         bookmark.folder = dst_folder
-        bookmark.updated_at = _now()
         if bookmark.encrypted:
             # Keep the same UUID file name so the filename-as-AAD stays valid.
             dst_dir = self._folder_dir(dst_folder)

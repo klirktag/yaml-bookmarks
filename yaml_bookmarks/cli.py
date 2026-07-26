@@ -12,9 +12,17 @@ from __future__ import annotations
 import argparse
 import getpass
 import sys
+from pathlib import Path
 
 from .settings import ensure_settings_file
-from .storage import BookmarkStore, EncryptionRequired, VaultLocked, normalize_folder
+from .storage import (
+    BOOKMARKS_SUBDIR,
+    DEFAULT_BASE_DIR,
+    BookmarkStore,
+    EncryptionRequired,
+    VaultLocked,
+    normalize_folder,
+)
 
 
 def _split_tags(value: str | None) -> list[str] | None:
@@ -36,8 +44,8 @@ def _print_bookmark(b, verbose: bool = False) -> None:
         if b.tags:
             print(f"  tags: {', '.join(b.tags)}")
         print(f"  folder: {b.folder or '(root)'}")
-        if b.updated_at:
-            print(f"  updated: {b.updated_at}")
+        if b.created:
+            print(f"  created: {b.created}")
 
 
 def cmd_add(store: BookmarkStore, args) -> int:
@@ -52,6 +60,7 @@ def cmd_add(store: BookmarkStore, args) -> int:
             title=args.title or "",
             description=args.description or "",
             tags=_split_tags(args.tags) or [],
+            created=args.created,
         )
     except (FileExistsError, ValueError, VaultLocked, EncryptionRequired) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -184,7 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dir",
-        help="bookmark directory (default: $HOME/.yaml-bookmarks or $YAML_BOOKMARKS_DIR)",
+        help="base directory (default: $HOME/.yaml-bookmarks or $YAML_BOOKMARKS_DIR); "
+        "bookmarks live in <dir>/bookmarks and settings in <dir>/settings.yaml",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -204,6 +214,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("-t", "--title")
     p_add.add_argument("-d", "--description")
     p_add.add_argument("--tags", help="comma-separated tags")
+    p_add.add_argument(
+        "--created", type=int, help="creation time as a unix timestamp (default: now)"
+    )
     p_add.add_argument(
         "-e", "--encrypt", action="store_true", help="store this bookmark encrypted"
     )
@@ -271,9 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    store = BookmarkStore(args.dir) if args.dir else BookmarkStore()
-    # Global settings live in <store>/settings.yaml (created on first run).
-    args.settings = ensure_settings_file(store.directory)
+    base = Path(args.dir).expanduser() if args.dir else DEFAULT_BASE_DIR
+    store = BookmarkStore(base / BOOKMARKS_SUBDIR)
+    # Global settings live in <base>/settings.yaml (created on first run);
+    # bookmarks live in <base>/bookmarks/.
+    args.settings = ensure_settings_file(base)
     store.allow_unencrypted = args.settings.allow_unencrypted
     # A bare "--password" (const "") prompts; "--password PW" unlocks directly.
     password = getattr(args, "password", None)

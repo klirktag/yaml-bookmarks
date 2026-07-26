@@ -22,7 +22,7 @@ def test_add_and_get(store):
     assert b is not None
     assert b.title == "Example"
     assert b.tags == ["a", "b"]
-    assert b.created_at and b.updated_at
+    assert isinstance(b.created, int) and b.created > 0   # auto-set on add
 
 
 def test_add_duplicate_raises(store):
@@ -39,11 +39,11 @@ def test_file_lives_under_dir(store, tmp_path):
 
 def test_update(store):
     store.add("https://example.com", title="Old")
-    created = store.get("https://example.com").created_at
+    created = store.get("https://example.com").created
     updated = store.update("https://example.com", title="New", tags=["x"])
     assert updated.title == "New"
     assert updated.tags == ["x"]
-    assert updated.created_at == created  # created_at preserved
+    assert updated.created == created  # created preserved
 
 
 def test_update_missing_raises(store):
@@ -58,13 +58,12 @@ def test_remove(store):
     assert store.remove("https://example.com") is False
 
 
-def test_list_sorted_recent_first(store):
-    store.add("https://a.com")
-    store.add("https://b.com")
-    store.update("https://a.com", title="touched")  # bumps updated_at
+def test_list_sorted_newest_first(store):
+    store.save(Bookmark(url="https://old.com", created=1000))
+    store.save(Bookmark(url="https://new.com", created=2000))
     urls = [b.url for b in store.list()]
-    assert urls[0] == "https://a.com"
-    assert set(urls) == {"https://a.com", "https://b.com"}
+    assert urls[0] == "https://new.com"  # newest (largest created) first
+    assert set(urls) == {"https://old.com", "https://new.com"}
 
 
 def test_save_upsert(store):
@@ -114,15 +113,15 @@ def test_list_carries_folder(store):
     assert by_url["https://nested.com"] == "x/y"
 
 
-def test_move_preserves_created_at(store):
+def test_move_preserves_created(store):
     store.add("https://example.com", folder="a", title="T", tags=["k"])
-    created = store.get("https://example.com", folder="a").created_at
+    created = store.get("https://example.com", folder="a").created
     moved = store.move("https://example.com", "a", "b/c")
     assert moved.folder == "b/c"
     assert store.get("https://example.com", folder="a") is None
     dst = store.get("https://example.com", folder="b/c")
     assert dst.title == "T" and dst.tags == ["k"]
-    assert dst.created_at == created
+    assert dst.created == created
 
 
 def test_folders_lists_tree_including_empty(store):
@@ -193,9 +192,9 @@ def test_wrong_password_reveals_nothing(store):
 def test_encrypted_update_move_remove(store):
     store.unlock("pw")
     store.add("https://s.example", encrypt=True, folder="a", title="v1")
-    created = store.get("https://s.example", "a").created_at
+    created = store.get("https://s.example", "a").created
     up = store.update("https://s.example", folder="a", title="v2")
-    assert up.title == "v2" and up.created_at == created
+    assert up.title == "v2" and up.created == created
     mv = store.move("https://s.example", "a", "b")
     assert mv.folder == "b" and mv.encrypted
     assert store.get("https://s.example", "a") is None

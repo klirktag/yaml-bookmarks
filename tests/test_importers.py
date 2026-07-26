@@ -38,9 +38,14 @@ def test_parse_fields():
         "https://nested.example",
         "https://slash.example",
     }  # the row without a URL is skipped
+    import datetime
+
+    def _unix(iso):
+        return int(datetime.datetime.fromisoformat(iso).timestamp())
+
     root = bms["https://root.example"]
     assert root.folder == "" and root.title == "Root Item"
-    assert root.created_at == "2026-03-30T11:36:02+00:00"      # ms dropped, Z -> +00:00
+    assert root.created == _unix("2026-03-30T11:36:02+00:00")   # unix seconds
     nested = bms["https://nested.example"]
     assert nested.folder == "Acting/Voice acting"
     assert nested.tags == ["a", "b"]

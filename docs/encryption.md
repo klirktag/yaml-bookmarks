@@ -128,8 +128,7 @@ url: https://example.com
 title: Example
 description: ...
 tags: [a, b]
-created_at: 2026-01-01T00:00:00+00:00
-updated_at: 2026-01-01T00:00:00+00:00
+created: 1769380888   # optional unix timestamp (seconds)
 ```
 
 An **encrypted** bookmark has filename `<uuid4>.yaml` (random, leaks nothing) and
@@ -146,12 +145,12 @@ ciphertext: <base64>            # AEAD-encrypts the whole payload below
 ```
 
 The plaintext that gets encrypted into `ciphertext` is exactly the normal record
-shown above (url, title, description, tags, timestamps).
+shown above (url, title, description, tags, and optional `created`).
 
 Notes:
 
-- **Encrypt everything**, including `created_at` / `updated_at` — plaintext
-  timestamps would leak activity patterns. The folder (per the existing model)
+- **Encrypt everything**, including the `created` timestamp — a plaintext date
+  would leak activity patterns. The folder (per the existing model)
   is still expressed by the file's directory location, which is *not* encrypted;
   users who consider folder names sensitive should keep encrypted bookmarks at
   the root or in innocuously named folders.

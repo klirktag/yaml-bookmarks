@@ -1,7 +1,7 @@
 # YAML Bookmarks
 
 A simple, personal bookmark manager. Every bookmark is one YAML file under
-`$HOME/.yaml-bookmarks/`, named after a filesystem-safe escaping of its URL.
+`$HOME/.yaml-bookmarks/bookmarks/`, named after a filesystem-safe escaping of its URL.
 Comes with a CLI and a localhost-only web UI that installs as a PWA.
 
 It's meant to be run by one person on their own machine. Bookmarks are **not**
@@ -42,8 +42,9 @@ environment variable.
 ## Folders
 
 Bookmarks can be organised into folders and subfolders, and those folders **are
-real directories** under `$HOME/.yaml-bookmarks/`. A bookmark in `work/projects`
-is simply the file `~/.yaml-bookmarks/work/projects/<escaped-url>.yaml`. The
+real directories** under `$HOME/.yaml-bookmarks/bookmarks/`. A bookmark in
+`work/projects` is simply the file
+`~/.yaml-bookmarks/bookmarks/work/projects/<escaped-url>.yaml`. The
 filesystem is the single source of truth, so the folder is derived from the
 file's location and is *not* duplicated inside the YAML. Move a file with your
 OS file manager and the app follows along; the same URL may live in more than
@@ -112,9 +113,10 @@ description: A description
 tags:
 - web
 - reference
-created_at: '2026-07-25T20:41:28+00:00'
-updated_at: '2026-07-25T20:41:28+00:00'
+created: 1769380888   # optional unix timestamp (seconds since the epoch)
 ```
+
+`created` is optional — older bookmarks may not have it.
 
 ## Import
 

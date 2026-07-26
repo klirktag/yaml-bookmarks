@@ -29,6 +29,7 @@ from html.parser import HTMLParser
 from flask import Flask, Response, jsonify, request
 
 from .importers import import_raindrop
+from .settings import ensure_settings_file
 from .storage import (
     Bookmark,
     BookmarkStore,
@@ -257,6 +258,11 @@ def create_app(store: BookmarkStore) -> Flask:
                     store.move(url, original, folder)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        raw_created = data.get("created")
+        try:
+            created = int(raw_created) if raw_created not in (None, "") else None
+        except (TypeError, ValueError):
+            created = None
         # While a password is engaged, a *new* bookmark is encrypted with it;
         # editing an existing bookmark keeps whatever kind it already is.
         try:
@@ -267,6 +273,7 @@ def create_app(store: BookmarkStore) -> Flask:
                     title=(data.get("title") or "").strip(),
                     description=(data.get("description") or "").strip(),
                     tags=_clean_tags(data.get("tags")),
+                    created=created,
                 ),
                 encrypt=store.is_unlocked,
             )
@@ -415,6 +422,9 @@ def run_server(
     port: int = 22222,
     open_browser: bool = True,
 ) -> None:
+    # Make sure the base dir and settings.yaml exist (recreate if missing).
+    # settings.yaml lives in the base dir, i.e. the parent of the bookmarks dir.
+    ensure_settings_file(store.directory.parent)
     app = create_app(store)
     url = f"http://{host}:{port}/"
     print(f"{APP_NAME} running at {url}")
@@ -451,7 +461,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v12';
+const CACHE = 'yaml-bookmarks-v13';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -648,6 +658,7 @@ _INDEX_HTML = """<!doctype html>
   .tag { background: var(--panel2); color: var(--muted); }
   .fbadge { background: var(--accent-soft); color: var(--accent2); cursor: pointer; border-color: transparent; }
   .fbadge:hover { text-decoration: underline; }
+  .when { font-size: .78rem; color: var(--muted); }
   .actions { display: flex; gap: 4px; margin-top: 10px; }
   .empty { color: var(--muted); text-align: center; padding: 50px 20px; }
   footer.foot { text-align: center; color: var(--muted); font-size: .8rem; padding: 26px 20px 6px; }
@@ -680,6 +691,8 @@ _INDEX_HTML = """<!doctype html>
         </label>
         <datalist id="folderOptions"></datalist>
         <input id="f-tags" type="text" placeholder="tags, comma, separated" autocomplete="off">
+        <input id="f-created" type="number" inputmode="numeric" autocomplete="off"
+               placeholder="Created (unix timestamp, optional)">
         <textarea id="f-desc" placeholder="Description (optional)"></textarea>
         <div class="row">
           <button type="submit" id="submitBtn">Add bookmark</button>
@@ -838,11 +851,14 @@ function renderList() {
     const fb = b.folder
       ? `<span class="fbadge" data-goto="${esc(b.folder)}">📁 ${esc(b.folder)}</span>` : '';
     const lock = b.encrypted ? '<span class="lock-badge" title="Encrypted">🔒</span>' : '';
+    const when = b.created
+      ? `<span class="when" title="Created ${esc(new Date(b.created*1000).toLocaleString())}">📅 ${esc(new Date(b.created*1000).toLocaleDateString())}</span>`
+      : '';
     return `<li class="card">
       <div class="title">${esc(b.title || b.url)}${lock}</div>
       <a class="url" href="${esc(b.url)}" target="_blank" rel="noopener">${esc(b.url)}</a>
       ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ''}
-      ${(fb || tags) ? `<div class="meta">${fb}${tags}</div>` : ''}
+      ${(fb || tags || when) ? `<div class="meta">${when}${fb}${tags}</div>` : ''}
       <div class="actions">
         <button class="ghost" data-edit="${i}">Edit</button>
         <button class="ghost danger" data-del="${i}">Delete</button>
@@ -888,6 +904,7 @@ $('list').addEventListener('click', async (e) => {
     $('f-folder').value = b.folder || '';
     $('f-desc').value = b.description || '';
     $('f-tags').value = (b.tags || []).join(', ');
+    $('f-created').value = b.created != null ? b.created : '';
     $('formTitle').textContent = 'Edit bookmark';
     $('submitBtn').textContent = 'Save changes';
     $('cancelEdit').style.display = 'inline-block';
@@ -905,6 +922,7 @@ $('addForm').addEventListener('submit', async (e) => {
     description: $('f-desc').value.trim(),
     tags: $('f-tags').value,
     folder: $('f-folder').value.trim(),
+    created: $('f-created').value.trim(),
   };
   if (editingUrl) payload.original_folder = editingFolder;
   const res = await fetch('/api/bookmarks', {

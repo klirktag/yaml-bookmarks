@@ -24,10 +24,8 @@ id,title,note,excerpt,url,folder,tags,created,cover,highlights,favorite
 | `excerpt`  | `description` | Used only when `note` is empty. |
 | `tags`     | `tags`        | Comma-separated cell → list; each tag trimmed. |
 | `folder`   | *folder / location* | See folder mapping below. |
-| `created`  | `created_at`  | ISO-8601 (e.g. `2026-03-30T11:36:02.712Z`) → our `…+00:00`, seconds precision. Bad/empty → filled at import time. |
+| `created`  | `created`     | ISO-8601 (e.g. `2026-03-30T11:36:02.712Z`) → optional **unix timestamp** (seconds). Bad/empty leaves it unset; `save` then fills it with the import time. |
 | `id`, `cover`, `highlights`, `favorite` | — | Not imported (no field for them in the model). |
-
-`updated_at` is set to the import time by `BookmarkStore.save`.
 
 ### Folder mapping
 

@@ -55,18 +55,18 @@ def _split_tags(raw: str | None) -> list[str]:
     return [t.strip() for t in raw.split(",") if t.strip()]
 
 
-def _parse_created(raw: str | None) -> str:
-    """Raindrop's ISO timestamp (e.g. 2026-03-30T11:36:02.712Z) → our format."""
+def _parse_created_unix(raw: str | None) -> int | None:
+    """Raindrop's ISO timestamp (e.g. 2026-03-30T11:36:02.712Z) → unix seconds."""
     raw = (raw or "").strip()
     if not raw:
-        return ""
+        return None
     try:
         dt = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
-        return ""
+        return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_dt.timezone.utc)
-    return dt.astimezone(_dt.timezone.utc).replace(microsecond=0).isoformat()
+    return int(dt.timestamp())
 
 
 def parse_raindrop_csv(text: str) -> list[Bookmark]:
@@ -78,7 +78,6 @@ def parse_raindrop_csv(text: str) -> list[Bookmark]:
         if not url:
             continue
         description = (row.get("note") or "").strip() or (row.get("excerpt") or "").strip()
-        created = _parse_created(row.get("created"))
         bookmarks.append(
             Bookmark(
                 url=url,
@@ -86,8 +85,7 @@ def parse_raindrop_csv(text: str) -> list[Bookmark]:
                 description=description,
                 tags=_split_tags(row.get("tags")),
                 folder=_raindrop_folder(row.get("folder")),
-                created_at=created,
-                updated_at=created,
+                created=_parse_created_unix(row.get("created")),
             )
         )
     return bookmarks

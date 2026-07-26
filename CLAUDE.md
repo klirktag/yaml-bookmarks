@@ -5,7 +5,7 @@ Guidance for working in this repository.
 ## What this is
 
 `yaml-bookmarks` is a personal bookmark manager. Every bookmark is a single YAML
-file on disk under `$HOME/.yaml-bookmarks/`, and bookmarks can be organised into
+file on disk under `$HOME/.yaml-bookmarks/bookmarks/`, and bookmarks can be organised into
 folders (collections) that are **real directories** under that path. It ships
 two front-ends over the same storage layer:
 
@@ -71,13 +71,18 @@ Example: `https://example.com/Path` → `https_3A_2F_2Fexample.com_2F_50ath.yaml
 ## Storage model (`storage.py`)
 
 `Bookmark` is a dataclass: `url`, `title`, `description`, `tags`, `folder`,
-`created_at`, `updated_at` (ISO-8601 UTC, seconds precision).
+and an optional `created` (unix timestamp, seconds; absent on bookmarks that
+predate the field). Auto-set to now on add; the importer fills it from the
+source. Bookmarks are listed newest-`created` first.
 
 - `folder` is a runtime attribute **derived from the file's location**;
   `to_yaml_dict()` drops it before writing, `to_dict()` keeps it (for the JSON
   API), and `_read()` sets it from the path so location always wins.
-- The store directory is `$HOME/.yaml-bookmarks`, overridable via the
-  `YAML_BOOKMARKS_DIR` env var or `BookmarkStore(directory)`.
+- The **base** directory is `$HOME/.yaml-bookmarks` (holds `settings.yaml` and
+  any future top-level files); the **store** directory — where bookmark files and
+  collection folders live — is its `bookmarks/` subfolder,
+  `$HOME/.yaml-bookmarks/bookmarks`. `YAML_BOOKMARKS_DIR` / CLI `--dir` set the
+  *base*; `BookmarkStore(directory)` takes the *store* dir directly.
 
 `BookmarkStore` methods:
 
@@ -85,8 +90,8 @@ Example: `https://example.com/Path` → `https_3A_2F_2Fexample.com_2F_50ath.yaml
 |---|---|
 | `add(url, folder=, title=, description=, tags=)` | raises `FileExistsError` if it already exists at that folder |
 | `update(url, folder=, ...)` | only the fields you pass change; raises `FileNotFoundError` if missing |
-| `save(bookmark)` | upsert at `bookmark.folder`; preserves `created_at` |
-| `move(url, src_folder, dst_folder)` | relocates the file, preserving content & `created_at` |
+| `save(bookmark)` | upsert at `bookmark.folder`; preserves/auto-sets `created` |
+| `move(url, src_folder, dst_folder)` | relocates the file, preserving content & `created` |
 | `remove(url, folder=)` | returns `True` if a file was deleted |
 | `get(url, folder=)` / `exists(...)` | single lookup at an exact folder |
 | `list()` | all bookmarks, recursive, most-recently-updated first |
@@ -205,10 +210,11 @@ and update it when import behaviour changes.
 
 ## Settings
 
-Global settings live in `<store>/settings.yaml` (always the store root), created
-with a documented default on first run by `settings.ensure_settings_file()`. The
-CLI/web entry points load it and apply it; `BookmarkStore` skips this file in
-`_all_paths()` so it's never a bookmark. Current keys:
+Global settings live in `<base>/settings.yaml` (the base dir, a sibling of the
+`bookmarks/` store dir), created with a documented default on first run by
+`settings.ensure_settings_file()`. The CLI/web entry points load it and apply it.
+Because it sits outside the store dir, it is never seen by the bookmark scanner.
+Current keys:
 
 - `port` — web UI port (explicit `--port` overrides it).
 - `allow_unencrypted` — when `false`, adding a *new* unencrypted bookmark raises
@@ -235,8 +241,7 @@ description: A description
 tags:
 - web
 - reference
-created_at: '2026-07-25T20:41:28+00:00'
-updated_at: '2026-07-25T20:41:28+00:00'
+created: 1769380888   # optional unix timestamp (seconds); omitted if unset
 ```
 
 There is intentionally **no `folder:` key** — the folder is the directory the
