@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import getpass
 import sys
 from pathlib import Path
@@ -31,6 +32,14 @@ def _split_tags(value: str | None) -> list[str] | None:
     return [t.strip() for t in value.split(",") if t.strip()]
 
 
+def _fmt_created(ts) -> str:
+    """Render a unix timestamp as a human-readable local date/time."""
+    try:
+        return datetime.datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return str(ts)
+
+
 def _print_bookmark(b, verbose: bool = False) -> None:
     prefix = f"[{b.folder}] " if b.folder else ""
     lock = " 🔒" if b.encrypted else ""
@@ -45,7 +54,7 @@ def _print_bookmark(b, verbose: bool = False) -> None:
             print(f"  tags: {', '.join(b.tags)}")
         print(f"  folder: {b.folder or '(root)'}")
         if b.created:
-            print(f"  created: {b.created}")
+            print(f"  created: {_fmt_created(b.created)}")
 
 
 def cmd_add(store: BookmarkStore, args) -> int:
@@ -60,7 +69,6 @@ def cmd_add(store: BookmarkStore, args) -> int:
             title=args.title or "",
             description=args.description or "",
             tags=_split_tags(args.tags) or [],
-            created=args.created,
         )
     except (FileExistsError, ValueError, VaultLocked, EncryptionRequired) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -214,9 +222,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("-t", "--title")
     p_add.add_argument("-d", "--description")
     p_add.add_argument("--tags", help="comma-separated tags")
-    p_add.add_argument(
-        "--created", type=int, help="creation time as a unix timestamp (default: now)"
-    )
     p_add.add_argument(
         "-e", "--encrypt", action="store_true", help="store this bookmark encrypted"
     )

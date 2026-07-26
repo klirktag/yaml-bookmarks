@@ -258,13 +258,9 @@ def create_app(store: BookmarkStore) -> Flask:
                     store.move(url, original, folder)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        raw_created = data.get("created")
-        try:
-            created = int(raw_created) if raw_created not in (None, "") else None
-        except (TypeError, ValueError):
-            created = None
         # While a password is engaged, a *new* bookmark is encrypted with it;
         # editing an existing bookmark keeps whatever kind it already is.
+        # `created` is auto-set to now for new bookmarks and preserved on edits.
         try:
             b = store.save(
                 Bookmark(
@@ -273,7 +269,6 @@ def create_app(store: BookmarkStore) -> Flask:
                     title=(data.get("title") or "").strip(),
                     description=(data.get("description") or "").strip(),
                     tags=_clean_tags(data.get("tags")),
-                    created=created,
                 ),
                 encrypt=store.is_unlocked,
             )
@@ -461,7 +456,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v13';
+const CACHE = 'yaml-bookmarks-v14';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -691,8 +686,6 @@ _INDEX_HTML = """<!doctype html>
         </label>
         <datalist id="folderOptions"></datalist>
         <input id="f-tags" type="text" placeholder="tags, comma, separated" autocomplete="off">
-        <input id="f-created" type="number" inputmode="numeric" autocomplete="off"
-               placeholder="Created (unix timestamp, optional)">
         <textarea id="f-desc" placeholder="Description (optional)"></textarea>
         <div class="row">
           <button type="submit" id="submitBtn">Add bookmark</button>
@@ -904,7 +897,6 @@ $('list').addEventListener('click', async (e) => {
     $('f-folder').value = b.folder || '';
     $('f-desc').value = b.description || '';
     $('f-tags').value = (b.tags || []).join(', ');
-    $('f-created').value = b.created != null ? b.created : '';
     $('formTitle').textContent = 'Edit bookmark';
     $('submitBtn').textContent = 'Save changes';
     $('cancelEdit').style.display = 'inline-block';
@@ -922,7 +914,6 @@ $('addForm').addEventListener('submit', async (e) => {
     description: $('f-desc').value.trim(),
     tags: $('f-tags').value,
     folder: $('f-folder').value.trim(),
-    created: $('f-created').value.trim(),
   };
   if (editingUrl) payload.original_folder = editingFolder;
   const res = await fetch('/api/bookmarks', {
