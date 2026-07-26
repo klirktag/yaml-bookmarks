@@ -456,7 +456,7 @@ _MANIFEST = {
 }
 
 _SERVICE_WORKER = """
-const CACHE = 'yaml-bookmarks-v14';
+const CACHE = 'yaml-bookmarks-v16';
 const SHELL = ['/', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -519,7 +519,9 @@ _INDEX_HTML = """<!doctype html>
     box-shadow: 0 1px 6px rgba(0,0,0,.18); z-index: 20;
   }
   header h1 { font-size: 1.1rem; margin: 0; font-weight: 700; letter-spacing: .2px; }
-  header .sub { color: rgba(255,255,255,.75); font-size: .82rem; margin-left: auto; }
+  header.offline { background: var(--danger); }
+  .status-ok { margin-left: auto; font-size: .82rem; font-weight: 600; color: #bbf7d0; }
+  .offline-warn { margin-left: auto; font-weight: 700; font-size: .9rem; color: #fff; }
   .lockbtn {
     background: rgba(255,255,255,.16); color: #fff; border: none; border-radius: 9px;
     padding: 6px 11px; font-size: 1.15rem; line-height: 1; cursor: pointer;
@@ -662,9 +664,11 @@ _INDEX_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<header>
+<header id="topbar">
   <h1>🔖 YAML Bookmarks</h1>
-  <span class="sub">personal · localhost</span>
+  <span class="status-ok" id="onlineOk" style="display:none">✓ Connected to localhost backend</span>
+  <span class="offline-warn" id="offlineWarn" role="alert"
+        style="display:none">⚠ Could not connect to localhost backend</span>
   <button id="lockBtn" class="lockbtn" type="button"
           title="Show encrypted bookmarks">🔓</button>
 </header>
@@ -761,10 +765,17 @@ let unlocked = false;
 let allowUnencrypted = true;
 
 async function load() {
-  const [b, f] = await Promise.all([
-    fetch('/api/bookmarks').then((r) => r.json()),
-    fetch('/api/folders').then((r) => r.json()),
-  ]);
+  let b, f;
+  try {
+    [b, f] = await Promise.all([
+      fetch('/api/bookmarks').then((r) => r.json()),
+      fetch('/api/folders').then((r) => r.json()),
+    ]);
+  } catch (e) {
+    setBackend(false);
+    return;
+  }
+  setBackend(true);
   all = b; folders = f;
   renderSidebar(); renderDatalist(); renderList();
 }
@@ -1147,14 +1158,36 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
 }
 
-async function init() {
+/* ---- Backend connectivity (localhost) ---- */
+let backendOk = true;
+function setBackend(ok) {
+  backendOk = ok;
+  $('onlineOk').style.display = ok ? 'inline' : 'none';
+  $('offlineWarn').style.display = ok ? 'none' : 'inline';
+  $('topbar').classList.toggle('offline', !ok);
+}
+async function refreshStatus() {
+  const wasOk = backendOk;
   try {
-    const s = await fetch('/api/status').then((r) => r.json());
-    unlocked = !!s.unlocked;
-    allowUnencrypted = s.allow_unencrypted !== false;
-  } catch (e) { unlocked = false; }
+    const res = await fetch('/api/status', { cache: 'no-store' });
+    if (res.ok) {
+      const s = await res.json();
+      unlocked = !!s.unlocked;
+      allowUnencrypted = s.allow_unencrypted !== false;
+      updateLock();
+    }
+    setBackend(true);            // got a response => the localhost backend is up
+    if (!wasOk) await load();     // just recovered => refresh data
+  } catch (e) {
+    setBackend(false);           // network error => backend unreachable
+  }
+}
+
+async function init() {
+  await refreshStatus();
   updateLock();
-  await load();
+  if (backendOk) await load();
+  setInterval(refreshStatus, 5000);   // keep the connection indicator live
 }
 init();
 </script>
